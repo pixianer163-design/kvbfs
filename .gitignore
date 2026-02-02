@@ -1,0 +1,21 @@
+# Build
+build/
+cmake-build-*/
+compile_commands.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Binaries
+kvbfs
+*.o
+*.a
+*.so
+
+# Test data
+/tmp/
+*.db
