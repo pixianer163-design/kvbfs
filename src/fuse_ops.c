@@ -91,13 +91,24 @@ static void kvbfs_init(void *userdata, struct fuse_conn_info *conn)
 {
     (void)userdata;
     (void)conn;
-    /* TODO: 初始化 */
+
+    /* 上下文已在 main.c 中初始化 */
+    printf("KVBFS initialized\n");
 }
 
 static void kvbfs_destroy(void *userdata)
 {
     (void)userdata;
-    /* TODO: 清理 */
+
+    printf("KVBFS shutting down...\n");
+
+    /* 同步所有脏 inode */
+    inode_sync_all();
+
+    /* 清理缓存 */
+    inode_cache_clear();
+
+    printf("KVBFS shutdown complete\n");
 }
 
 static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
