@@ -1,6 +1,7 @@
 #include "context.h"
 #include "kv_store.h"
 #include "super.h"
+#include "inode.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +45,11 @@ void ctx_destroy(struct kvbfs_ctx *ctx)
 {
     if (!ctx) return;
 
-    /* TODO: 同步所有脏 inode */
+    /* 同步所有脏 inode */
+    inode_sync_all();
+
+    /* 释放 inode 缓存 */
+    inode_cache_clear();
 
     /* 保存超级块 */
     super_save(ctx);
@@ -57,8 +62,6 @@ void ctx_destroy(struct kvbfs_ctx *ctx)
     /* 销毁锁 */
     pthread_mutex_destroy(&ctx->icache_lock);
     pthread_mutex_destroy(&ctx->alloc_lock);
-
-    /* TODO: 释放 inode 缓存 */
 
     free(ctx);
 }

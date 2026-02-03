@@ -4,6 +4,8 @@
 
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <time.h>
 #include "super.h"
 #include <unistd.h>
 #include <sys/stat.h>
@@ -17,7 +19,7 @@ static void inode_to_stat(const struct kvbfs_inode *inode, struct stat *st)
     st->st_mode = inode->mode;
     st->st_nlink = inode->nlink;
     st->st_size = inode->size;
-    st->st_blocks = inode->blocks;
+    st->st_blocks = inode->blocks * (KVBFS_BLOCK_SIZE / 512);
     st->st_blksize = KVBFS_BLOCK_SIZE;
     st->st_atim = inode->atime;
     st->st_mtim = inode->mtime;
@@ -190,6 +192,25 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
                 char key[64];
                 int keylen = kvbfs_key_block(key, sizeof(key), ino, i);
                 kv_delete(g_ctx->db, key, keylen);
+            }
+
+            /* 零填充最后一个保留块的尾部，避免暴露旧数据 */
+            size_t tail_off = new_size % KVBFS_BLOCK_SIZE;
+            if (tail_off > 0 && new_blocks > 0) {
+                uint64_t last_block = new_blocks - 1;
+                char key[64];
+                int keylen = kvbfs_key_block(key, sizeof(key), ino, last_block);
+
+                char *block_data = NULL;
+                size_t block_len = 0;
+                if (kv_get(g_ctx->db, key, keylen, &block_data, &block_len) == 0) {
+                    /* 零填充 tail_off 之后的部分 */
+                    if (block_len > tail_off) {
+                        memset(block_data + tail_off, 0, block_len - tail_off);
+                        kv_put(g_ctx->db, key, keylen, block_data, block_len);
+                    }
+                    free(block_data);
+                }
             }
         }
 
@@ -590,12 +611,30 @@ static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
     int is_file = S_ISREG(ic->inode.mode);
     pthread_rwlock_unlock(&ic->lock);
 
-    inode_put(ic);
-
     if (!is_file) {
+        inode_put(ic);
         fuse_reply_err(req, EISDIR);
         return;
     }
+
+    /* 处理 O_TRUNC：截断文件为 0 */
+    if (fi->flags & O_TRUNC) {
+        pthread_rwlock_wrlock(&ic->lock);
+        uint64_t old_blocks = ic->inode.blocks;
+        if (old_blocks > 0) {
+            delete_file_blocks(ino, old_blocks);
+        }
+        ic->inode.size = 0;
+        ic->inode.blocks = 0;
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        ic->inode.mtime = now;
+        ic->inode.ctime = now;
+        pthread_rwlock_unlock(&ic->lock);
+        inode_sync(ic);
+    }
+
+    inode_put(ic);
 
     fuse_reply_open(req, fi);
 }
@@ -654,8 +693,9 @@ static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
         size_t block_len = 0;
 
         int ret = kv_get(g_ctx->db, key, keylen, &block_data, &block_len);
-        if (ret != 0) {
-            /* 块不存在，填充零 */
+        if (ret != 0 || block_len <= block_off) {
+            /* 块不存在或偏移超出块数据，填充零 */
+            if (block_data) free(block_data);
             size_t to_copy = KVBFS_BLOCK_SIZE - block_off;
             if (to_copy > size - bytes_read) to_copy = size - bytes_read;
             memset(buf + bytes_read, 0, to_copy);
@@ -713,13 +753,8 @@ static void kvbfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 
         memcpy(block + block_off, buf + bytes_written, to_write);
 
-        /* 保存块 */
-        size_t block_size = block_off + to_write;
-        if (block_size < KVBFS_BLOCK_SIZE) {
-            /* 可能块后面还有数据 */
-            block_size = KVBFS_BLOCK_SIZE;
-        }
-        if (kv_put(g_ctx->db, key, keylen, block, block_size) != 0) {
+        /* 保存完整块，保持统一块大小 */
+        if (kv_put(g_ctx->db, key, keylen, block, KVBFS_BLOCK_SIZE) != 0) {
             inode_put(ic);
             fuse_reply_err(req, EIO);
             return;
@@ -783,6 +818,16 @@ static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
             dirent_remove(newparent, newname);
             if (!is_dir) {
                 delete_file_blocks(dst_ino, blocks);
+            } else {
+                /* 被替换的目标是目录，减少 newparent 的 nlink */
+                struct kvbfs_inode_cache *np_ic = inode_get(newparent);
+                if (np_ic) {
+                    pthread_rwlock_wrlock(&np_ic->lock);
+                    if (np_ic->inode.nlink > 0) np_ic->inode.nlink--;
+                    pthread_rwlock_unlock(&np_ic->lock);
+                    inode_sync(np_ic);
+                    inode_put(np_ic);
+                }
             }
             inode_delete(dst_ino);
         }
@@ -836,6 +881,24 @@ static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
     fuse_reply_err(req, 0);
 }
 
+static void kvbfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
+                        struct fuse_file_info *fi)
+{
+    (void)datasync;
+    (void)fi;
+
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    int ret = inode_sync(ic);
+    inode_put(ic);
+
+    fuse_reply_err(req, ret == 0 ? 0 : EIO);
+}
+
 /* FUSE 操作表 */
 struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .init       = kvbfs_init,
@@ -854,4 +917,5 @@ struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .read       = kvbfs_read,
     .write      = kvbfs_write,
     .rename     = kvbfs_rename,
+    .fsync      = kvbfs_fsync,
 };

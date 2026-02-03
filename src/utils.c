@@ -26,7 +26,8 @@ void log_msg(int level, const char *fmt, ...)
     const char *level_str[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 
     time_t now = time(NULL);
-    struct tm *tm = localtime(&now);
+    struct tm tm_buf;
+    struct tm *tm = localtime_r(&now, &tm_buf);
 
     fprintf(stderr, "[%04d-%02d-%02d %02d:%02d:%02d] [%s] ",
             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,

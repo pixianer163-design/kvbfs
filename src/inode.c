@@ -153,9 +153,14 @@ int inode_delete(uint64_t ino)
     struct kvbfs_inode_cache *ic = NULL;
     HASH_FIND(hh, g_ctx->icache, &ino, sizeof(uint64_t), ic);
     if (ic) {
-        HASH_DEL(g_ctx->icache, ic);
-        pthread_rwlock_destroy(&ic->lock);
-        free(ic);
+        if (ic->refcount == 0) {
+            HASH_DEL(g_ctx->icache, ic);
+            pthread_rwlock_destroy(&ic->lock);
+            free(ic);
+        } else {
+            /* 仍有引用，仅从哈希表移除，标记为脏以防止复用 */
+            HASH_DEL(g_ctx->icache, ic);
+        }
     }
     pthread_mutex_unlock(&g_ctx->icache_lock);
 
@@ -188,17 +193,45 @@ int inode_sync_all(void)
 {
     int ret = 0;
 
+    /* 收集脏 inode 并增加引用计数，避免持锁时调用 inode_sync */
+    size_t count = 0;
+    size_t capacity = 64;
+    struct kvbfs_inode_cache **dirty_list = malloc(capacity * sizeof(*dirty_list));
+    if (!dirty_list) return -1;
+
     pthread_mutex_lock(&g_ctx->icache_lock);
     struct kvbfs_inode_cache *ic, *tmp;
     HASH_ITER(hh, g_ctx->icache, ic, tmp) {
         if (ic->dirty) {
-            if (inode_sync(ic) != 0) {
-                ret = -1;
+            ic->refcount++;
+            if (count >= capacity) {
+                capacity *= 2;
+                struct kvbfs_inode_cache **new_list = realloc(dirty_list, capacity * sizeof(*dirty_list));
+                if (!new_list) {
+                    /* 回退已增加的引用计数 */
+                    for (size_t i = 0; i < count; i++) {
+                        dirty_list[i]->refcount--;
+                    }
+                    pthread_mutex_unlock(&g_ctx->icache_lock);
+                    free(dirty_list);
+                    return -1;
+                }
+                dirty_list = new_list;
             }
+            dirty_list[count++] = ic;
         }
     }
     pthread_mutex_unlock(&g_ctx->icache_lock);
 
+    /* 在无锁状态下逐个同步 */
+    for (size_t i = 0; i < count; i++) {
+        if (inode_sync(dirty_list[i]) != 0) {
+            ret = -1;
+        }
+        inode_put(dirty_list[i]);
+    }
+
+    free(dirty_list);
     return ret;
 }
 
