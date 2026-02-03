@@ -562,13 +562,74 @@ static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 static void kvbfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
                         size_t size, off_t off, struct fuse_file_info *fi)
 {
-    (void)ino;
-    (void)buf;
-    (void)size;
-    (void)off;
     (void)fi;
-    /* TODO: 实现 write */
-    fuse_reply_err(req, ENOSYS);
+
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    size_t bytes_written = 0;
+    uint64_t block_idx = off / KVBFS_BLOCK_SIZE;
+    size_t block_off = off % KVBFS_BLOCK_SIZE;
+
+    while (bytes_written < size) {
+        char key[64];
+        int keylen = kvbfs_key_block(key, sizeof(key), ino, block_idx);
+
+        /* 读取现有块（如果存在）或创建新块 */
+        char block[KVBFS_BLOCK_SIZE];
+        memset(block, 0, KVBFS_BLOCK_SIZE);
+
+        char *existing = NULL;
+        size_t existing_len = 0;
+        if (kv_get(g_ctx->db, key, keylen, &existing, &existing_len) == 0) {
+            size_t copy_len = existing_len < KVBFS_BLOCK_SIZE ? existing_len : KVBFS_BLOCK_SIZE;
+            memcpy(block, existing, copy_len);
+            free(existing);
+        }
+
+        /* 写入数据到块 */
+        size_t to_write = KVBFS_BLOCK_SIZE - block_off;
+        if (to_write > size - bytes_written) to_write = size - bytes_written;
+
+        memcpy(block + block_off, buf + bytes_written, to_write);
+
+        /* 保存块 */
+        size_t block_size = block_off + to_write;
+        if (block_size < KVBFS_BLOCK_SIZE) {
+            /* 可能块后面还有数据 */
+            block_size = KVBFS_BLOCK_SIZE;
+        }
+        if (kv_put(g_ctx->db, key, keylen, block, block_size) != 0) {
+            inode_put(ic);
+            fuse_reply_err(req, EIO);
+            return;
+        }
+
+        bytes_written += to_write;
+        block_idx++;
+        block_off = 0;
+    }
+
+    /* 更新文件大小 */
+    pthread_rwlock_wrlock(&ic->lock);
+    if ((uint64_t)(off + size) > ic->inode.size) {
+        ic->inode.size = off + size;
+    }
+    ic->inode.blocks = (ic->inode.size + KVBFS_BLOCK_SIZE - 1) / KVBFS_BLOCK_SIZE;
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    ic->inode.mtime = now;
+    ic->inode.ctime = now;
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_sync(ic);
+    inode_put(ic);
+
+    fuse_reply_write(req, bytes_written);
 }
 
 static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
