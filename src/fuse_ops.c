@@ -4,8 +4,27 @@
 
 #include <string.h>
 #include <errno.h>
+#include "super.h"
+#include <unistd.h>
+#include <sys/stat.h>
 
 /* FUSE lowlevel 操作实现 */
+
+static void inode_to_stat(const struct kvbfs_inode *inode, struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_ino = inode->ino;
+    st->st_mode = inode->mode;
+    st->st_nlink = inode->nlink;
+    st->st_size = inode->size;
+    st->st_blocks = inode->blocks;
+    st->st_blksize = KVBFS_BLOCK_SIZE;
+    st->st_atim = inode->atime;
+    st->st_mtim = inode->mtime;
+    st->st_ctim = inode->ctime;
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+}
 
 static void kvbfs_init(void *userdata, struct fuse_conn_info *conn)
 {
@@ -30,10 +49,22 @@ static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 static void kvbfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void)ino;
     (void)fi;
-    /* TODO: 实现 getattr */
-    fuse_reply_err(req, ENOSYS);
+
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    struct stat st;
+    pthread_rwlock_rdlock(&ic->lock);
+    inode_to_stat(&ic->inode, &st);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    fuse_reply_attr(req, &st, 1.0);  /* 1 second cache */
 }
 
 static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
