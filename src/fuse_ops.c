@@ -26,6 +26,46 @@ static void inode_to_stat(const struct kvbfs_inode *inode, struct stat *st)
     st->st_gid = getgid();
 }
 
+/* 查找目录项，返回子 inode 号，未找到返回 0 */
+static uint64_t dirent_lookup(uint64_t parent, const char *name)
+{
+    char key[256];
+    int keylen = kvbfs_key_dirent(key, sizeof(key), parent, name);
+
+    char *value = NULL;
+    size_t value_len = 0;
+
+    int ret = kv_get(g_ctx->db, key, keylen, &value, &value_len);
+    if (ret != 0 || value_len != sizeof(uint64_t)) {
+        if (value) free(value);
+        return 0;
+    }
+
+    uint64_t child_ino;
+    memcpy(&child_ino, value, sizeof(uint64_t));
+    free(value);
+    return child_ino;
+}
+
+/* 添加目录项 */
+static int dirent_add(uint64_t parent, const char *name, uint64_t child)
+{
+    char key[256];
+    int keylen = kvbfs_key_dirent(key, sizeof(key), parent, name);
+
+    return kv_put(g_ctx->db, key, keylen,
+                  (const char *)&child, sizeof(uint64_t));
+}
+
+/* 删除目录项 */
+static int dirent_remove(uint64_t parent, const char *name)
+{
+    char key[256];
+    int keylen = kvbfs_key_dirent(key, sizeof(key), parent, name);
+
+    return kv_delete(g_ctx->db, key, keylen);
+}
+
 static void kvbfs_init(void *userdata, struct fuse_conn_info *conn)
 {
     (void)userdata;
@@ -41,10 +81,31 @@ static void kvbfs_destroy(void *userdata)
 
 static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-    (void)parent;
-    (void)name;
-    /* TODO: 实现 lookup */
-    fuse_reply_err(req, ENOSYS);
+    uint64_t child_ino = dirent_lookup(parent, name);
+    if (child_ino == 0) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    struct kvbfs_inode_cache *ic = inode_get(child_ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = child_ino;
+    e.attr_timeout = 1.0;
+    e.entry_timeout = 1.0;
+
+    pthread_rwlock_rdlock(&ic->lock);
+    inode_to_stat(&ic->inode, &e.attr);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    fuse_reply_entry(req, &e);
 }
 
 static void kvbfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
