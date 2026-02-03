@@ -741,13 +741,88 @@ static void kvbfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
                          fuse_ino_t newparent, const char *newname, unsigned int flags)
 {
-    (void)parent;
-    (void)name;
-    (void)newparent;
-    (void)newname;
-    (void)flags;
-    /* TODO: 实现 rename */
-    fuse_reply_err(req, ENOSYS);
+    (void)flags;  /* 暂不支持 RENAME_EXCHANGE 等 */
+
+    /* 查找源文件 */
+    uint64_t src_ino = dirent_lookup(parent, name);
+    if (src_ino == 0) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    /* 检查目标是否已存在 */
+    uint64_t dst_ino = dirent_lookup(newparent, newname);
+    if (dst_ino != 0) {
+        /* 目标存在，需要先删除 */
+        struct kvbfs_inode_cache *dst_ic = inode_get(dst_ino);
+        if (dst_ic) {
+            pthread_rwlock_rdlock(&dst_ic->lock);
+            int is_dir = S_ISDIR(dst_ic->inode.mode);
+            uint64_t blocks = dst_ic->inode.blocks;
+            pthread_rwlock_unlock(&dst_ic->lock);
+            inode_put(dst_ic);
+
+            if (is_dir) {
+                if (!dirent_is_empty(dst_ino)) {
+                    fuse_reply_err(req, ENOTEMPTY);
+                    return;
+                }
+            }
+
+            dirent_remove(newparent, newname);
+            if (!is_dir) {
+                delete_file_blocks(dst_ino, blocks);
+            }
+            inode_delete(dst_ino);
+        }
+    }
+
+    /* 获取源 inode 信息 */
+    struct kvbfs_inode_cache *src_ic = inode_get(src_ino);
+    int src_is_dir = 0;
+    if (src_ic) {
+        pthread_rwlock_rdlock(&src_ic->lock);
+        src_is_dir = S_ISDIR(src_ic->inode.mode);
+        pthread_rwlock_unlock(&src_ic->lock);
+        inode_put(src_ic);
+    }
+
+    /* 删除旧目录项 */
+    if (dirent_remove(parent, name) != 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 添加新目录项 */
+    if (dirent_add(newparent, newname, src_ino) != 0) {
+        /* 尝试恢复 */
+        dirent_add(parent, name, src_ino);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 如果是目录且跨目录移动，更新父目录 nlink */
+    if (src_is_dir && parent != newparent) {
+        struct kvbfs_inode_cache *old_pic = inode_get(parent);
+        if (old_pic) {
+            pthread_rwlock_wrlock(&old_pic->lock);
+            if (old_pic->inode.nlink > 0) old_pic->inode.nlink--;
+            pthread_rwlock_unlock(&old_pic->lock);
+            inode_sync(old_pic);
+            inode_put(old_pic);
+        }
+
+        struct kvbfs_inode_cache *new_pic = inode_get(newparent);
+        if (new_pic) {
+            pthread_rwlock_wrlock(&new_pic->lock);
+            new_pic->inode.nlink++;
+            pthread_rwlock_unlock(&new_pic->lock);
+            inode_sync(new_pic);
+            inode_put(new_pic);
+        }
+    }
+
+    fuse_reply_err(req, 0);
 }
 
 /* FUSE 操作表 */
