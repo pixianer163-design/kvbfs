@@ -152,12 +152,68 @@ static void kvbfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
                           int to_set, struct fuse_file_info *fi)
 {
-    (void)ino;
-    (void)attr;
-    (void)to_set;
     (void)fi;
-    /* TODO: 实现 setattr */
-    fuse_reply_err(req, ENOSYS);
+
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_wrlock(&ic->lock);
+
+    if (to_set & FUSE_SET_ATTR_MODE) {
+        ic->inode.mode = (ic->inode.mode & S_IFMT) | (attr->st_mode & 0777);
+    }
+
+    if (to_set & FUSE_SET_ATTR_SIZE) {
+        uint64_t old_size = ic->inode.size;
+        uint64_t new_size = attr->st_size;
+
+        if (new_size < old_size) {
+            /* 截断：删除多余的块 */
+            uint64_t old_blocks = (old_size + KVBFS_BLOCK_SIZE - 1) / KVBFS_BLOCK_SIZE;
+            uint64_t new_blocks = (new_size + KVBFS_BLOCK_SIZE - 1) / KVBFS_BLOCK_SIZE;
+
+            for (uint64_t i = new_blocks; i < old_blocks; i++) {
+                char key[64];
+                int keylen = kvbfs_key_block(key, sizeof(key), ino, i);
+                kv_delete(g_ctx->db, key, keylen);
+            }
+        }
+
+        ic->inode.size = new_size;
+        ic->inode.blocks = (new_size + KVBFS_BLOCK_SIZE - 1) / KVBFS_BLOCK_SIZE;
+    }
+
+    if (to_set & FUSE_SET_ATTR_ATIME) {
+        ic->inode.atime = attr->st_atim;
+    }
+
+    if (to_set & FUSE_SET_ATTR_MTIME) {
+        ic->inode.mtime = attr->st_mtim;
+    }
+
+    if (to_set & (FUSE_SET_ATTR_ATIME_NOW | FUSE_SET_ATTR_MTIME_NOW)) {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (to_set & FUSE_SET_ATTR_ATIME_NOW) ic->inode.atime = now;
+        if (to_set & FUSE_SET_ATTR_MTIME_NOW) ic->inode.mtime = now;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    ic->inode.ctime = now;
+
+    struct stat st;
+    inode_to_stat(&ic->inode, &st);
+
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_sync(ic);
+    inode_put(ic);
+
+    fuse_reply_attr(req, &st, 1.0);
 }
 
 static void kvbfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
