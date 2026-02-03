@@ -27,6 +27,7 @@ set(KVBFS_SOURCES
     src/kv_store.c
     src/kv_rocksdb.c
     src/inode.c
+    src/super.c
     src/utils.c
 )
 
