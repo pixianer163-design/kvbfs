@@ -399,12 +399,58 @@ static void kvbfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
 static void kvbfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
                          mode_t mode, struct fuse_file_info *fi)
 {
-    (void)parent;
-    (void)name;
-    (void)mode;
-    (void)fi;
-    /* TODO: 实现 create */
-    fuse_reply_err(req, ENOSYS);
+    /* 检查父目录 */
+    struct kvbfs_inode_cache *pic = inode_get(parent);
+    if (!pic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&pic->lock);
+    int is_dir = S_ISDIR(pic->inode.mode);
+    pthread_rwlock_unlock(&pic->lock);
+    inode_put(pic);
+
+    if (!is_dir) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    /* 检查是否已存在 */
+    if (dirent_lookup(parent, name) != 0) {
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+
+    /* 创建新文件 inode */
+    struct kvbfs_inode_cache *ic = inode_create(S_IFREG | (mode & 0777));
+    if (!ic) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 添加目录项 */
+    if (dirent_add(parent, name, ic->inode.ino) != 0) {
+        inode_delete(ic->inode.ino);
+        inode_put(ic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 返回新文件信息 */
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = ic->inode.ino;
+    e.attr_timeout = 1.0;
+    e.entry_timeout = 1.0;
+
+    pthread_rwlock_rdlock(&ic->lock);
+    inode_to_stat(&ic->inode, &e.attr);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    fuse_reply_create(req, &e, fi);
 }
 
 static void kvbfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
