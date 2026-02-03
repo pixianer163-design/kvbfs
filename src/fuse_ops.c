@@ -78,6 +78,15 @@ static int dirent_is_empty(uint64_t ino)
     return empty;
 }
 
+static void delete_file_blocks(uint64_t ino, uint64_t blocks)
+{
+    for (uint64_t i = 0; i < blocks; i++) {
+        char key[64];
+        int keylen = kvbfs_key_block(key, sizeof(key), ino, i);
+        kv_delete(g_ctx->db, key, keylen);
+    }
+}
+
 static void kvbfs_init(void *userdata, struct fuse_conn_info *conn)
 {
     (void)userdata;
@@ -455,10 +464,51 @@ static void kvbfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 static void kvbfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-    (void)parent;
-    (void)name;
-    /* TODO: 实现 unlink */
-    fuse_reply_err(req, ENOSYS);
+    /* 查找文件 */
+    uint64_t child_ino = dirent_lookup(parent, name);
+    if (child_ino == 0) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    struct kvbfs_inode_cache *ic = inode_get(child_ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    int is_dir = S_ISDIR(ic->inode.mode);
+    uint64_t blocks = ic->inode.blocks;
+    pthread_rwlock_unlock(&ic->lock);
+
+    if (is_dir) {
+        inode_put(ic);
+        fuse_reply_err(req, EISDIR);
+        return;
+    }
+
+    /* 删除目录项 */
+    if (dirent_remove(parent, name) != 0) {
+        inode_put(ic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 减少 nlink，如果为 0 则删除 */
+    pthread_rwlock_wrlock(&ic->lock);
+    if (ic->inode.nlink > 0) ic->inode.nlink--;
+    int should_delete = (ic->inode.nlink == 0);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    if (should_delete) {
+        delete_file_blocks(child_ino, blocks);
+        inode_delete(child_ino);
+    }
+
+    fuse_reply_err(req, 0);
 }
 
 static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
