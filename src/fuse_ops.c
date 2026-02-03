@@ -294,10 +294,24 @@ static void kvbfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void)ino;
-    (void)fi;
-    /* TODO: 实现 open */
-    fuse_reply_err(req, ENOSYS);
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    int is_file = S_ISREG(ic->inode.mode);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    if (!is_file) {
+        fuse_reply_err(req, EISDIR);
+        return;
+    }
+
+    fuse_reply_open(req, fi);
 }
 
 static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -311,12 +325,69 @@ static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
                        off_t off, struct fuse_file_info *fi)
 {
-    (void)ino;
-    (void)size;
-    (void)off;
     (void)fi;
-    /* TODO: 实现 read */
-    fuse_reply_err(req, ENOSYS);
+
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    uint64_t file_size = ic->inode.size;
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    /* 超出文件末尾 */
+    if ((uint64_t)off >= file_size) {
+        fuse_reply_buf(req, NULL, 0);
+        return;
+    }
+
+    /* 调整读取大小 */
+    if (off + size > file_size) {
+        size = file_size - off;
+    }
+
+    char *buf = malloc(size);
+    if (!buf) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+
+    size_t bytes_read = 0;
+    uint64_t block_idx = off / KVBFS_BLOCK_SIZE;
+    size_t block_off = off % KVBFS_BLOCK_SIZE;
+
+    while (bytes_read < size) {
+        char key[64];
+        int keylen = kvbfs_key_block(key, sizeof(key), ino, block_idx);
+
+        char *block_data = NULL;
+        size_t block_len = 0;
+
+        int ret = kv_get(g_ctx->db, key, keylen, &block_data, &block_len);
+        if (ret != 0) {
+            /* 块不存在，填充零 */
+            size_t to_copy = KVBFS_BLOCK_SIZE - block_off;
+            if (to_copy > size - bytes_read) to_copy = size - bytes_read;
+            memset(buf + bytes_read, 0, to_copy);
+            bytes_read += to_copy;
+        } else {
+            size_t to_copy = block_len - block_off;
+            if (to_copy > size - bytes_read) to_copy = size - bytes_read;
+            memcpy(buf + bytes_read, block_data + block_off, to_copy);
+            bytes_read += to_copy;
+            free(block_data);
+        }
+
+        block_idx++;
+        block_off = 0;  /* 后续块从头开始 */
+    }
+
+    fuse_reply_buf(req, buf, bytes_read);
+    free(buf);
 }
 
 static void kvbfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
