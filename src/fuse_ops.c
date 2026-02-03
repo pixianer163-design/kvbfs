@@ -258,11 +258,74 @@ done:
 
 static void kvbfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
 {
-    (void)parent;
-    (void)name;
-    (void)mode;
-    /* TODO: 实现 mkdir */
-    fuse_reply_err(req, ENOSYS);
+    /* 检查父目录存在且是目录 */
+    struct kvbfs_inode_cache *pic = inode_get(parent);
+    if (!pic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&pic->lock);
+    int is_dir = S_ISDIR(pic->inode.mode);
+    pthread_rwlock_unlock(&pic->lock);
+
+    if (!is_dir) {
+        inode_put(pic);
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    /* 检查是否已存在 */
+    if (dirent_lookup(parent, name) != 0) {
+        inode_put(pic);
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+
+    /* 创建新目录 inode */
+    struct kvbfs_inode_cache *ic = inode_create(S_IFDIR | (mode & 0777));
+    if (!ic) {
+        inode_put(pic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 设置 nlink = 2 (. 和 父目录的引用) */
+    pthread_rwlock_wrlock(&ic->lock);
+    ic->inode.nlink = 2;
+    pthread_rwlock_unlock(&ic->lock);
+    inode_sync(ic);
+
+    /* 添加目录项 */
+    if (dirent_add(parent, name, ic->inode.ino) != 0) {
+        inode_delete(ic->inode.ino);
+        inode_put(ic);
+        inode_put(pic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 增加父目录 nlink */
+    pthread_rwlock_wrlock(&pic->lock);
+    pic->inode.nlink++;
+    pthread_rwlock_unlock(&pic->lock);
+    inode_sync(pic);
+    inode_put(pic);
+
+    /* 返回新目录信息 */
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = ic->inode.ino;
+    e.attr_timeout = 1.0;
+    e.entry_timeout = 1.0;
+
+    pthread_rwlock_rdlock(&ic->lock);
+    inode_to_stat(&ic->inode, &e.attr);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    fuse_reply_entry(req, &e);
 }
 
 static void kvbfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
