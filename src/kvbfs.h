@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <time.h>
 
 #include "uthash.h"
@@ -56,5 +57,30 @@ struct kvbfs_ctx {
 
 /* 全局上下文 */
 extern struct kvbfs_ctx *g_ctx;
+
+/* KV key 常量 */
+#define KVBFS_KEY_SUPER     "sb"
+#define KVBFS_KEY_NEXT_INO  "next_ino"
+
+/* KV key 格式化辅助函数 */
+static inline int kvbfs_key_inode(char *buf, size_t buflen, uint64_t ino)
+{
+    return snprintf(buf, buflen, "i:%lu", (unsigned long)ino);
+}
+
+static inline int kvbfs_key_dirent(char *buf, size_t buflen, uint64_t parent, const char *name)
+{
+    return snprintf(buf, buflen, "d:%lu:%s", (unsigned long)parent, name);
+}
+
+static inline int kvbfs_key_block(char *buf, size_t buflen, uint64_t ino, uint64_t block)
+{
+    return snprintf(buf, buflen, "b:%lu:%lu", (unsigned long)ino, (unsigned long)block);
+}
+
+static inline int kvbfs_key_dirent_prefix(char *buf, size_t buflen, uint64_t parent)
+{
+    return snprintf(buf, buflen, "d:%lu:", (unsigned long)parent);
+}
 
 #endif /* KVBFS_H */
