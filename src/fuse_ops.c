@@ -593,8 +593,8 @@ static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 {
     (void)ino;
     (void)fi;
-    /* TODO: 实现 release */
-    fuse_reply_err(req, ENOSYS);
+    /* 目前不需要特殊处理 */
+    fuse_reply_err(req, 0);
 }
 
 static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
