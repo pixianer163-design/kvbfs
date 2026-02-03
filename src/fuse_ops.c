@@ -66,6 +66,18 @@ static int dirent_remove(uint64_t parent, const char *name)
     return kv_delete(g_ctx->db, key, keylen);
 }
 
+static int dirent_is_empty(uint64_t ino)
+{
+    char prefix[64];
+    int prefix_len = kvbfs_key_dirent_prefix(prefix, sizeof(prefix), ino);
+
+    kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
+    int empty = !kv_iter_valid(iter);
+    kv_iter_free(iter);
+
+    return empty;
+}
+
 static void kvbfs_init(void *userdata, struct fuse_conn_info *conn)
 {
     (void)userdata;
@@ -330,10 +342,58 @@ static void kvbfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mod
 
 static void kvbfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-    (void)parent;
-    (void)name;
-    /* TODO: 实现 rmdir */
-    fuse_reply_err(req, ENOSYS);
+    /* 查找目标目录 */
+    uint64_t child_ino = dirent_lookup(parent, name);
+    if (child_ino == 0) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    struct kvbfs_inode_cache *ic = inode_get(child_ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    int is_dir = S_ISDIR(ic->inode.mode);
+    pthread_rwlock_unlock(&ic->lock);
+
+    if (!is_dir) {
+        inode_put(ic);
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    /* 检查目录是否为空 */
+    if (!dirent_is_empty(child_ino)) {
+        inode_put(ic);
+        fuse_reply_err(req, ENOTEMPTY);
+        return;
+    }
+
+    /* 删除目录项 */
+    if (dirent_remove(parent, name) != 0) {
+        inode_put(ic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 减少父目录 nlink */
+    struct kvbfs_inode_cache *pic = inode_get(parent);
+    if (pic) {
+        pthread_rwlock_wrlock(&pic->lock);
+        if (pic->inode.nlink > 0) pic->inode.nlink--;
+        pthread_rwlock_unlock(&pic->lock);
+        inode_sync(pic);
+        inode_put(pic);
+    }
+
+    /* 删除 inode */
+    inode_put(ic);
+    inode_delete(child_ino);
+
+    fuse_reply_err(req, 0);
 }
 
 static void kvbfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
