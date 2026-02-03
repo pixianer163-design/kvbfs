@@ -139,15 +139,121 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     fuse_reply_err(req, ENOSYS);
 }
 
+static void kvbfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    int is_dir = S_ISDIR(ic->inode.mode);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    if (!is_dir) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    fuse_reply_open(req, fi);
+}
+
 static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
                           off_t off, struct fuse_file_info *fi)
 {
-    (void)ino;
-    (void)size;
-    (void)off;
     (void)fi;
-    /* TODO: 实现 readdir */
-    fuse_reply_err(req, ENOSYS);
+
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    inode_put(ic);
+
+    char *buf = malloc(size);
+    if (!buf) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+
+    size_t buf_used = 0;
+    off_t entry_idx = 0;
+
+    /* . and .. entries */
+    if (off <= 0) {
+        struct stat st = {.st_ino = ino, .st_mode = S_IFDIR};
+        size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                           ".", &st, ++entry_idx);
+        if (entsize > size - buf_used) goto done;
+        buf_used += entsize;
+    }
+
+    if (off <= 1) {
+        struct stat st = {.st_ino = ino, .st_mode = S_IFDIR};  /* parent, simplified */
+        size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                           "..", &st, ++entry_idx);
+        if (entsize > size - buf_used) goto done;
+        buf_used += entsize;
+    }
+
+    /* 遍历目录项 */
+    char prefix[64];
+    int prefix_len = kvbfs_key_dirent_prefix(prefix, sizeof(prefix), ino);
+
+    kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
+    while (kv_iter_valid(iter)) {
+        entry_idx++;
+
+        if (entry_idx <= off) {
+            kv_iter_next(iter);
+            continue;
+        }
+
+        size_t key_len;
+        const char *key = kv_iter_key(iter, &key_len);
+
+        /* 提取文件名：跳过 "d:<parent>:" 前缀 */
+        const char *name = key + prefix_len;
+        size_t name_len = key_len - prefix_len;
+
+        /* 获取子 inode 号 */
+        size_t val_len;
+        const char *val = kv_iter_value(iter, &val_len);
+        uint64_t child_ino;
+        memcpy(&child_ino, val, sizeof(uint64_t));
+
+        /* 获取子 inode 属性 */
+        struct kvbfs_inode child_inode;
+        struct stat st = {0};
+        if (inode_load(child_ino, &child_inode) == 0) {
+            st.st_ino = child_ino;
+            st.st_mode = child_inode.mode;
+        }
+
+        /* 需要 null-terminated name */
+        char name_buf[256];
+        if (name_len >= sizeof(name_buf)) name_len = sizeof(name_buf) - 1;
+        memcpy(name_buf, name, name_len);
+        name_buf[name_len] = '\0';
+
+        size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                           name_buf, &st, entry_idx + 1);
+        if (entsize > size - buf_used) {
+            kv_iter_free(iter);
+            goto done;
+        }
+        buf_used += entsize;
+
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+
+done:
+    fuse_reply_buf(req, buf, buf_used);
+    free(buf);
 }
 
 static void kvbfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
@@ -245,6 +351,7 @@ struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .getattr    = kvbfs_getattr,
     .setattr    = kvbfs_setattr,
     .readdir    = kvbfs_readdir,
+    .opendir    = kvbfs_opendir,
     .mkdir      = kvbfs_mkdir,
     .rmdir      = kvbfs_rmdir,
     .create     = kvbfs_create,
