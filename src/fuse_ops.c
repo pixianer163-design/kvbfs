@@ -899,6 +899,206 @@ static void kvbfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
     fuse_reply_err(req, ret == 0 ? 0 : EIO);
 }
 
+static void kvbfs_symlink(fuse_req_t req, const char *link, fuse_ino_t parent,
+                          const char *name)
+{
+    /* 检查父目录 */
+    struct kvbfs_inode_cache *pic = inode_get(parent);
+    if (!pic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&pic->lock);
+    int is_dir = S_ISDIR(pic->inode.mode);
+    pthread_rwlock_unlock(&pic->lock);
+    inode_put(pic);
+
+    if (!is_dir) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    /* 检查是否已存在 */
+    if (dirent_lookup(parent, name) != 0) {
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+
+    /* 创建 symlink inode */
+    struct kvbfs_inode_cache *ic = inode_create(S_IFLNK | 0777);
+    if (!ic) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    uint64_t ino = ic->inode.ino;
+
+    /* 将 symlink 目标存储为 block 0 */
+    size_t link_len = strlen(link);
+    char key[64];
+    int keylen = kvbfs_key_block(key, sizeof(key), ino, 0);
+    if (kv_put(g_ctx->db, key, keylen, link, link_len) != 0) {
+        inode_delete(ino);
+        inode_put(ic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 更新 inode 大小和块数 */
+    pthread_rwlock_wrlock(&ic->lock);
+    ic->inode.size = link_len;
+    ic->inode.blocks = 1;
+    pthread_rwlock_unlock(&ic->lock);
+    inode_sync(ic);
+
+    /* 添加目录项 */
+    if (dirent_add(parent, name, ino) != 0) {
+        char bkey[64];
+        int bkeylen = kvbfs_key_block(bkey, sizeof(bkey), ino, 0);
+        kv_delete(g_ctx->db, bkey, bkeylen);
+        inode_delete(ino);
+        inode_put(ic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 返回新 symlink 信息 */
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = ino;
+    e.attr_timeout = 1.0;
+    e.entry_timeout = 1.0;
+
+    pthread_rwlock_rdlock(&ic->lock);
+    inode_to_stat(&ic->inode, &e.attr);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    fuse_reply_entry(req, &e);
+}
+
+static void kvbfs_readlink(fuse_req_t req, fuse_ino_t ino)
+{
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    int is_link = S_ISLNK(ic->inode.mode);
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_put(ic);
+
+    if (!is_link) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+
+    /* 从 block 0 读取 symlink 目标 */
+    char key[64];
+    int keylen = kvbfs_key_block(key, sizeof(key), ino, 0);
+
+    char *target = NULL;
+    size_t target_len = 0;
+    if (kv_get(g_ctx->db, key, keylen, &target, &target_len) != 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* null-terminate */
+    char *buf = malloc(target_len + 1);
+    if (!buf) {
+        free(target);
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    memcpy(buf, target, target_len);
+    buf[target_len] = '\0';
+    free(target);
+
+    fuse_reply_readlink(req, buf);
+    free(buf);
+}
+
+static void kvbfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
+                       const char *newname)
+{
+    /* 获取源 inode */
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&ic->lock);
+    int is_dir = S_ISDIR(ic->inode.mode);
+    pthread_rwlock_unlock(&ic->lock);
+
+    if (is_dir) {
+        inode_put(ic);
+        fuse_reply_err(req, EPERM);
+        return;
+    }
+
+    /* 检查目标父目录 */
+    struct kvbfs_inode_cache *pic = inode_get(newparent);
+    if (!pic) {
+        inode_put(ic);
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    pthread_rwlock_rdlock(&pic->lock);
+    int parent_is_dir = S_ISDIR(pic->inode.mode);
+    pthread_rwlock_unlock(&pic->lock);
+    inode_put(pic);
+
+    if (!parent_is_dir) {
+        inode_put(ic);
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    /* 检查目标名是否已存在 */
+    if (dirent_lookup(newparent, newname) != 0) {
+        inode_put(ic);
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+
+    /* 添加目录项 */
+    if (dirent_add(newparent, newname, ino) != 0) {
+        inode_put(ic);
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    /* 增加 nlink，更新 ctime */
+    pthread_rwlock_wrlock(&ic->lock);
+    ic->inode.nlink++;
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    ic->inode.ctime = now;
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = ino;
+    e.attr_timeout = 1.0;
+    e.entry_timeout = 1.0;
+    inode_to_stat(&ic->inode, &e.attr);
+
+    pthread_rwlock_unlock(&ic->lock);
+
+    inode_sync(ic);
+    inode_put(ic);
+
+    fuse_reply_entry(req, &e);
+}
+
 /* FUSE 操作表 */
 struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .init       = kvbfs_init,
@@ -918,4 +1118,7 @@ struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .write      = kvbfs_write,
     .rename     = kvbfs_rename,
     .fsync      = kvbfs_fsync,
+    .symlink    = kvbfs_symlink,
+    .readlink   = kvbfs_readlink,
+    .link       = kvbfs_link,
 };

@@ -194,8 +194,38 @@ else
     fail "create 10 files" "found $COUNT"
 fi
 
+# ============================================================
+echo "--- Test 10: Symlink create and readlink ---"
+echo "nvme_sym_data" > "$MNT/sym_target.txt" 2>/dev/null
+if ln -s sym_target.txt "$MNT/sym_link.txt" 2>/dev/null; then
+    LINK=$(readlink "$MNT/sym_link.txt" 2>/dev/null || echo "READLINK_ERROR")
+    CONTENT=$(cat "$MNT/sym_link.txt" 2>/dev/null || echo "READ_ERROR")
+    if [ "$LINK" = "sym_target.txt" ] && [ "$CONTENT" = "nvme_sym_data" ]; then
+        pass "symlink"
+    else
+        fail "symlink" "readlink='$LINK' content='$CONTENT'"
+    fi
+else
+    fail "create symlink"
+fi
+
+# ============================================================
+echo "--- Test 11: Hardlink ---"
+echo "nvme_hl_data" > "$MNT/hl_orig.txt" 2>/dev/null
+if ln "$MNT/hl_orig.txt" "$MNT/hl_link.txt" 2>/dev/null; then
+    CONTENT=$(cat "$MNT/hl_link.txt" 2>/dev/null || echo "READ_ERROR")
+    NLINK=$(stat -c %h "$MNT/hl_orig.txt" 2>/dev/null || echo "0")
+    if [ "$CONTENT" = "nvme_hl_data" ] && [ "$NLINK" = "2" ]; then
+        pass "hardlink"
+    else
+        fail "hardlink" "content='$CONTENT' nlink=$NLINK"
+    fi
+else
+    fail "create hardlink"
+fi
+
 # Cleanup test files
-rm -f "$MNT"/multi_*.txt "$MNT/test.txt" 2>/dev/null
+rm -f "$MNT"/multi_*.txt "$MNT/test.txt" "$MNT/sym_target.txt" "$MNT/sym_link.txt" "$MNT/hl_orig.txt" "$MNT/hl_link.txt" 2>/dev/null
 
 # ============================================================
 echo ""

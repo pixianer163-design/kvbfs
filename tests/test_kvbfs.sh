@@ -341,6 +341,112 @@ fi
 rm -f "$MNT"/multi_*.txt "$MNT/permfile.txt" "$MNT/trunc.txt" "$MNT/syncfile.txt" "$MNT/large.bin" 2>/dev/null
 
 # ============================================================
+echo "--- Test 22: Create and read symlink ---"
+echo "symlink_target_data" > "$MNT/sym_target.txt" 2>/dev/null
+if ln -s sym_target.txt "$MNT/sym_link.txt" 2>/dev/null; then
+    LINK=$(readlink "$MNT/sym_link.txt" 2>/dev/null || echo "READLINK_ERROR")
+    if [ "$LINK" = "sym_target.txt" ]; then
+        pass "create and readlink symlink"
+    else
+        fail "readlink symlink" "expected 'sym_target.txt', got '$LINK'"
+    fi
+else
+    fail "create symlink"
+fi
+
+# ============================================================
+echo "--- Test 23: Access through symlink ---"
+CONTENT=$(cat "$MNT/sym_link.txt" 2>/dev/null || echo "READ_ERROR")
+if [ "$CONTENT" = "symlink_target_data" ]; then
+    pass "read through symlink"
+else
+    fail "read through symlink" "expected 'symlink_target_data', got '$CONTENT'"
+fi
+
+# ============================================================
+echo "--- Test 24: Dangling symlink ---"
+if ln -s nonexistent_file "$MNT/dangling_link" 2>/dev/null; then
+    LINK=$(readlink "$MNT/dangling_link" 2>/dev/null || echo "READLINK_ERROR")
+    if [ "$LINK" = "nonexistent_file" ]; then
+        pass "dangling symlink readlink"
+    else
+        fail "dangling symlink readlink" "got '$LINK'"
+    fi
+else
+    fail "create dangling symlink"
+fi
+
+# ============================================================
+echo "--- Test 25: Remove symlink ---"
+if rm "$MNT/sym_link.txt" 2>/dev/null; then
+    if [ ! -L "$MNT/sym_link.txt" ] && [ -f "$MNT/sym_target.txt" ]; then
+        pass "remove symlink (target intact)"
+    else
+        fail "remove symlink" "symlink still exists or target removed"
+    fi
+else
+    fail "remove symlink"
+fi
+
+# ============================================================
+echo "--- Test 26: Create hardlink ---"
+echo "hardlink_data" > "$MNT/hl_orig.txt" 2>/dev/null
+if ln "$MNT/hl_orig.txt" "$MNT/hl_link.txt" 2>/dev/null; then
+    ORIG_INO=$(stat -c %i "$MNT/hl_orig.txt" 2>/dev/null || echo "0")
+    LINK_INO=$(stat -c %i "$MNT/hl_link.txt" 2>/dev/null || echo "1")
+    if [ "$ORIG_INO" = "$LINK_INO" ]; then
+        pass "hardlink same inode"
+    else
+        fail "hardlink same inode" "orig=$ORIG_INO link=$LINK_INO"
+    fi
+else
+    fail "create hardlink"
+fi
+
+# ============================================================
+echo "--- Test 27: Hardlink nlink count ---"
+NLINK=$(stat -c %h "$MNT/hl_orig.txt" 2>/dev/null || echo "0")
+CONTENT=$(cat "$MNT/hl_link.txt" 2>/dev/null || echo "READ_ERROR")
+if [ "$NLINK" = "2" ] && [ "$CONTENT" = "hardlink_data" ]; then
+    pass "hardlink nlink=2 and content matches"
+else
+    fail "hardlink nlink/content" "nlink=$NLINK content='$CONTENT'"
+fi
+
+# ============================================================
+echo "--- Test 28: Remove original, hardlink survives ---"
+if rm "$MNT/hl_orig.txt" 2>/dev/null; then
+    CONTENT=$(cat "$MNT/hl_link.txt" 2>/dev/null || echo "READ_ERROR")
+    if [ "$CONTENT" = "hardlink_data" ]; then
+        pass "hardlink survives after original removed"
+    else
+        fail "hardlink survives" "got '$CONTENT'"
+    fi
+else
+    fail "remove original of hardlink"
+fi
+
+# ============================================================
+echo "--- Test 29: Symlink in subdirectory ---"
+mkdir "$MNT/linkdir" 2>/dev/null
+echo "cross_dir_data" > "$MNT/linkdir/real.txt" 2>/dev/null
+if ln -s linkdir/real.txt "$MNT/cross_link.txt" 2>/dev/null; then
+    CONTENT=$(cat "$MNT/cross_link.txt" 2>/dev/null || echo "READ_ERROR")
+    if [ "$CONTENT" = "cross_dir_data" ]; then
+        pass "symlink across directories"
+    else
+        fail "symlink across directories" "got '$CONTENT'"
+    fi
+else
+    fail "create cross-directory symlink"
+fi
+
+# Cleanup symlink/hardlink test files
+rm -f "$MNT/sym_target.txt" "$MNT/dangling_link" "$MNT/hl_link.txt" "$MNT/cross_link.txt" 2>/dev/null
+rm -f "$MNT/linkdir/real.txt" 2>/dev/null
+rmdir "$MNT/linkdir" 2>/dev/null
+
+# ============================================================
 echo ""
 echo "========================================="
 echo -e "  ${GREEN}PASS: $PASS${NC}  ${RED}FAIL: $FAIL${NC}  ${YELLOW}SKIP: $SKIP${NC}"
