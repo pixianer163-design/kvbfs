@@ -19,3 +19,6 @@ kvbfs
 # Test data
 /tmp/
 *.db
+
+# Windows artifacts
+nul
