@@ -19,7 +19,7 @@ void log_set_level(int level)
 
 void log_msg(int level, const char *fmt, ...)
 {
-    if (level < g_log_level) {
+    if ((enum log_level)level < g_log_level) {
         return;
     }
 
