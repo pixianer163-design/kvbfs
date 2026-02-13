@@ -20,5 +20,8 @@ kvbfs
 /tmp/
 *.db
 
+# Models (large binary files)
+cfs/models/
+
 # Windows artifacts
 nul
