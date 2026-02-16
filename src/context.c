@@ -6,6 +6,65 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#ifdef CFS_LOCAL_LLM
+/* 查找或创建 /sessions 目录，返回其 inode 号 */
+static uint64_t ensure_sessions_dir(struct kvbfs_ctx *ctx)
+{
+    const char *name = "sessions";
+
+    /* 在根目录下查找 */
+    char key[256];
+    int keylen = kvbfs_key_dirent(key, sizeof(key), KVBFS_ROOT_INO, name);
+
+    char *val = NULL;
+    size_t vlen = 0;
+    if (kv_get(ctx->db, key, keylen, &val, &vlen) == 0 && vlen == sizeof(uint64_t)) {
+        uint64_t ino;
+        memcpy(&ino, val, sizeof(uint64_t));
+        free(val);
+        printf("CFS: found /sessions (ino=%lu)\n", (unsigned long)ino);
+        return ino;
+    }
+    if (val) free(val);
+
+    /* 不存在，创建 */
+    struct kvbfs_inode_cache *ic = inode_create(S_IFDIR | 0755);
+    if (!ic) {
+        fprintf(stderr, "CFS: failed to create /sessions\n");
+        return 0;
+    }
+
+    pthread_rwlock_wrlock(&ic->lock);
+    ic->inode.nlink = 2;
+    pthread_rwlock_unlock(&ic->lock);
+    inode_sync(ic);
+
+    uint64_t ino = ic->inode.ino;
+    inode_put(ic);
+
+    /* 添加目录项 */
+    if (kv_put(ctx->db, key, keylen, (const char *)&ino, sizeof(uint64_t)) != 0) {
+        fprintf(stderr, "CFS: failed to add /sessions dirent\n");
+        inode_delete(ino);
+        return 0;
+    }
+
+    /* 增加根目录 nlink */
+    struct kvbfs_inode_cache *root = inode_get(KVBFS_ROOT_INO);
+    if (root) {
+        pthread_rwlock_wrlock(&root->lock);
+        root->inode.nlink++;
+        pthread_rwlock_unlock(&root->lock);
+        inode_sync(root);
+        inode_put(root);
+    }
+
+    printf("CFS: created /sessions (ino=%lu)\n", (unsigned long)ino);
+    return ino;
+}
+#endif
 
 struct kvbfs_ctx *ctx_init(const char *db_path)
 {
@@ -41,9 +100,39 @@ struct kvbfs_ctx *ctx_init(const char *db_path)
     return ctx;
 }
 
+#ifdef CFS_LOCAL_LLM
+int ctx_init_llm(struct kvbfs_ctx *ctx, const struct llm_config *config)
+{
+    /* 确保 /sessions 存在 */
+    ctx->sessions_ino = ensure_sessions_dir(ctx);
+    if (ctx->sessions_ino == 0) {
+        fprintf(stderr, "CFS: cannot determine sessions directory\n");
+        return -1;
+    }
+
+    /* 初始化 LLM 子系统 */
+    return llm_init(&ctx->llm, config);
+}
+#endif
+
+#ifdef CFS_MEMORY
+int ctx_init_mem(struct kvbfs_ctx *ctx, const struct mem_config *config)
+{
+    return mem_init(&ctx->mem, config);
+}
+#endif
+
 void ctx_destroy(struct kvbfs_ctx *ctx)
 {
     if (!ctx) return;
+
+#ifdef CFS_MEMORY
+    mem_destroy(&ctx->mem);
+#endif
+
+#ifdef CFS_LOCAL_LLM
+    llm_destroy(&ctx->llm);
+#endif
 
     /* 同步所有脏 inode */
     inode_sync_all();

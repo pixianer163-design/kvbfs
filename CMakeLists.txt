@@ -30,11 +30,60 @@ endif()
 
 message(STATUS "KVBFS backend: ${KVBFS_BACKEND}")
 
+# 本地 LLM 支持（可选）
+option(CFS_LOCAL_LLM "Enable local LLM inference via llama.cpp" OFF)
+
+set(LLM_SOURCES "")
+set(LLM_LIBS "")
+set(LLM_INCLUDE_DIRS "")
+set(LLM_DEFINITIONS "")
+
+if(CFS_LOCAL_LLM)
+    # llama.cpp 路径（可通过 -DLLAMA_DIR= 指定）
+    set(LLAMA_DIR "" CACHE PATH "Path to llama.cpp source tree")
+
+    if(LLAMA_DIR)
+        set(LLM_INCLUDE_DIRS ${LLAMA_DIR}/include ${LLAMA_DIR}/ggml/include)
+        set(LLM_LINK_DIRS ${LLAMA_DIR}/build/bin)
+        set(LLM_LIBS llama ggml ggml-base ggml-cpu)
+    else()
+        # 尝试 pkg-config
+        pkg_check_modules(LLAMA llama)
+        if(LLAMA_FOUND)
+            set(LLM_INCLUDE_DIRS ${LLAMA_INCLUDE_DIRS})
+            set(LLM_LIBS ${LLAMA_LIBRARIES})
+        else()
+            # 回退：系统路径
+            set(LLM_LIBS llama)
+        endif()
+    endif()
+
+    set(LLM_SOURCES src/llm.c)
+    set(LLM_DEFINITIONS CFS_LOCAL_LLM=1)
+    message(STATUS "CFS local LLM: enabled")
+else()
+    message(STATUS "CFS local LLM: disabled")
+endif()
+
+# Memory/embedding subsystem (requires CFS_LOCAL_LLM)
+option(CFS_MEMORY "Enable memory/embedding subsystem (requires CFS_LOCAL_LLM)" OFF)
+if(CFS_MEMORY AND NOT CFS_LOCAL_LLM)
+    message(FATAL_ERROR "CFS_MEMORY requires CFS_LOCAL_LLM")
+endif()
+if(CFS_MEMORY)
+    list(APPEND LLM_SOURCES src/mem.c)
+    list(APPEND LLM_DEFINITIONS CFS_MEMORY=1)
+    message(STATUS "CFS memory subsystem: enabled")
+else()
+    message(STATUS "CFS memory subsystem: disabled")
+endif()
+
 # 包含目录
 include_directories(
     ${CMAKE_SOURCE_DIR}/src
     ${FUSE3_INCLUDE_DIRS}
     ${BACKEND_INCLUDE_DIRS}
+    ${LLM_INCLUDE_DIRS}
 )
 
 # 源文件
@@ -47,7 +96,13 @@ set(KVBFS_SOURCES
     src/super.c
     src/context.c
     src/utils.c
+    ${LLM_SOURCES}
 )
+
+# 链接目录（用于本地 llama.cpp 构建）
+if(LLM_LINK_DIRS)
+    link_directories(${LLM_LINK_DIRS})
+endif()
 
 # 主程序
 add_executable(kvbfs ${KVBFS_SOURCES})
@@ -55,13 +110,24 @@ add_executable(kvbfs ${KVBFS_SOURCES})
 target_link_libraries(kvbfs
     ${FUSE3_LIBRARIES}
     ${BACKEND_LIBS}
+    ${LLM_LIBS}
     pthread
+    m
 )
 
 target_compile_definitions(kvbfs PRIVATE
     FUSE_USE_VERSION=35
     _FILE_OFFSET_BITS=64
+    ${LLM_DEFINITIONS}
 )
+
+# 设置 RPATH 以便运行时找到本地 llama.cpp 库
+if(LLM_LINK_DIRS)
+    set_target_properties(kvbfs PROPERTIES
+        BUILD_RPATH "${LLM_LINK_DIRS}"
+        INSTALL_RPATH "${LLM_LINK_DIRS}"
+    )
+endif()
 
 # 模拟器 (始终可构建)
 add_subdirectory(sim)

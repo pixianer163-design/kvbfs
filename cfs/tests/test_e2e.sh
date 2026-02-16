@@ -13,16 +13,24 @@ PASS=0
 FAIL=0
 
 # Helper: wait for generation to complete
+# Usage: wait_gen <session_id> [timeout_seconds] [expected_assistant_count]
 wait_gen() {
     local session_id="$1"
-    local timeout="${2:-30}"
+    local timeout="${2:-60}"
+    local expected_count="${3:-1}"
     local elapsed=0
-    while [ -f "$SESS/.generating.$session_id" ] && [ "$elapsed" -lt "$timeout" ]; do
-        sleep 0.1
+    # Wait until we have the expected number of Assistant: lines
+    while [ "$elapsed" -lt "$timeout" ]; do
+        local count
+        count=$(grep -c "^Assistant:" "$SESS/$session_id" 2>/dev/null || true)
+        count=${count:-0}
+        if [ "$count" -ge "$expected_count" ] && [ ! -f "$SESS/.generating.$session_id" ]; then
+            sleep 0.5
+            return
+        fi
+        sleep 1
         elapsed=$((elapsed + 1))
     done
-    # Extra wait for file flush
-    sleep 0.2
 }
 
 # Cleanup previous test files
@@ -48,9 +56,9 @@ fi
 # Test 2: Multi-turn context
 echo "[Test 2] Multi-turn context..."
 echo "User: My name is Alice." >> "$SESS/e2e_test1"
-wait_gen "e2e_test1"
+wait_gen "e2e_test1" 60 2
 echo "User: What is my name?" >> "$SESS/e2e_test1"
-wait_gen "e2e_test1"
+wait_gen "e2e_test1" 60 3
 if grep -qi "alice" "$SESS/e2e_test1"; then
     echo "  PASS: Context retained (Alice mentioned)"
     PASS=$((PASS + 1))

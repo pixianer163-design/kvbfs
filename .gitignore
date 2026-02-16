@@ -23,5 +23,8 @@ kvbfs
 # Models (large binary files)
 cfs/models/
 
+# Environment (credentials)
+.env
+
 # Windows artifacts
 nul

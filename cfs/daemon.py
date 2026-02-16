@@ -1,8 +1,13 @@
 """CFS-Local daemon: watches KVBFS mount for session file changes,
-triggers local LLM inference via llama-cpp-python, writes responses back.
+triggers LLM inference via configurable backends, writes responses back.
 
 Usage:
+    # Local model (llamacpp backend, default):
     CFS_MODEL_PATH=/path/to/model.gguf CFS_MOUNT=/mnt/kvbfs python daemon.py
+
+    # OpenAI-compatible API (openai backend):
+    CFS_BACKEND=openai CFS_API_KEY=sk-xxx CFS_API_BASE=https://api.deepseek.com/v1 \
+        CFS_API_MODEL=deepseek-chat CFS_MOUNT=/mnt/kvbfs python daemon.py
 """
 
 import argparse
@@ -95,7 +100,7 @@ def cleanup_stale_sentinels(sessions_dir: str):
 # Generation worker
 # ---------------------------------------------------------------------------
 
-def process_session(llm, config: Config, session_path: str, session_id: str):
+def process_session(backend, config: Config, session_path: str, session_id: str):
     """Read session file, run LLM inference, append response."""
     sessions_dir = config.sessions_dir
 
@@ -110,13 +115,12 @@ def process_session(llm, config: Config, session_path: str, session_id: str):
         prompt_content = trim_to_context(content, config.n_ctx * 3)
         prompt = build_prompt(prompt_content)
 
-        output = llm(
+        response_text = backend.generate(
             prompt,
             max_tokens=config.max_tokens,
             temperature=config.temperature,
             stop=config.stop_tokens,
         )
-        response_text = output["choices"][0]["text"].strip()
     except Exception as e:
         response_text = f"[Error: {str(e)[:200]}]"
         log.error("Generation failed for '%s': %s", session_id, e)
@@ -128,7 +132,7 @@ def process_session(llm, config: Config, session_path: str, session_id: str):
     log.info("Generated response for session '%s'", session_id)
 
 
-def worker_loop(llm, config: Config, gen_queue: queue.Queue,
+def worker_loop(backend, config: Config, gen_queue: queue.Queue,
                 shutdown: threading.Event):
     """Worker thread: process generation tasks from queue."""
     while not shutdown.is_set():
@@ -137,7 +141,7 @@ def worker_loop(llm, config: Config, gen_queue: queue.Queue,
         except queue.Empty:
             continue
         try:
-            process_session(llm, config, session_path, session_id)
+            process_session(backend, config, session_path, session_id)
         except Exception as e:
             log.error("Unhandled error for '%s': %s", session_id, e)
         finally:
@@ -184,18 +188,10 @@ def wait_for_mount(mount: str, timeout: float = 30.0):
     raise RuntimeError(f"Mount point '{mount}' not available after {timeout}s")
 
 
-def load_model(config: Config):
-    """Load LLM model via llama-cpp-python."""
-    from llama_cpp import Llama
-    log.info("Loading model from '%s'...", config.model_path)
-    llm = Llama(
-        model_path=config.model_path,
-        n_ctx=config.n_ctx,
-        n_gpu_layers=config.n_gpu_layers,
-        verbose=False,
-    )
-    log.info("Model loaded successfully")
-    return llm
+def load_backend(config: Config):
+    """Create and return the configured LLM backend."""
+    from backends import load_backend as _load_backend
+    return _load_backend(config)
 
 
 def parse_args() -> Config:
@@ -207,6 +203,11 @@ def parse_args() -> Config:
     parser.add_argument("--n-gpu-layers", type=int, help="GPU layers to offload")
     parser.add_argument("--max-tokens", type=int, help="Max generation tokens")
     parser.add_argument("--temperature", type=float, help="Sampling temperature")
+    parser.add_argument("--backend", choices=["llamacpp", "openai"],
+                        help="LLM backend to use")
+    parser.add_argument("--api-key", help="API key for OpenAI-compatible backend")
+    parser.add_argument("--api-base", help="API base URL for OpenAI-compatible backend")
+    parser.add_argument("--api-model", help="Model name for OpenAI-compatible backend")
     args = parser.parse_args()
 
     config = Config.from_env()
@@ -222,6 +223,14 @@ def parse_args() -> Config:
         config.max_tokens = args.max_tokens
     if args.temperature is not None:
         config.temperature = args.temperature
+    if args.backend:
+        config.backend = args.backend
+    if args.api_key:
+        config.api_key = args.api_key
+    if args.api_base:
+        config.api_base = args.api_base
+    if args.api_model:
+        config.api_model = args.api_model
     return config
 
 
@@ -246,8 +255,8 @@ def main():
     # Cleanup stale sentinels from previous crash
     cleanup_stale_sentinels(sessions_dir)
 
-    # Load LLM model
-    llm = load_model(config)
+    # Load LLM backend
+    backend = load_backend(config)
 
     # Setup inotify
     inotify_fd = inotify_simple.INotify()
@@ -269,7 +278,7 @@ def main():
     # Start worker thread
     worker = threading.Thread(
         target=worker_loop,
-        args=(llm, config, gen_queue, shutdown),
+        args=(backend, config, gen_queue, shutdown),
         daemon=True,
     )
     worker.start()

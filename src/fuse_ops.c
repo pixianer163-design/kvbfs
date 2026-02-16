@@ -9,6 +9,12 @@
 #include "super.h"
 #include <unistd.h>
 #include <sys/stat.h>
+#include <poll.h>
+
+#ifdef CFS_LOCAL_LLM
+#include "llm.h"
+static int is_session_file(fuse_ino_t ino);
+#endif
 
 /* FUSE lowlevel 操作实现 */
 
@@ -641,9 +647,16 @@ static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 
 static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void)ino;
     (void)fi;
-    /* 目前不需要特殊处理 */
+
+#ifdef CFS_LOCAL_LLM
+    /* 如果文件在 /sessions 目录下且可写打开，尝试触发推理 */
+    if (fi->flags != O_RDONLY && is_session_file(ino))
+        llm_submit(&g_ctx->llm, ino);
+#else
+    (void)ino;
+#endif
+
     fuse_reply_err(req, 0);
 }
 
@@ -1099,6 +1112,139 @@ static void kvbfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
     fuse_reply_entry(req, &e);
 }
 
+#ifdef CFS_LOCAL_LLM
+/* 检查 ino 是否是 /sessions 目录下的文件 */
+static int is_session_file(fuse_ino_t ino)
+{
+    if (g_ctx->sessions_ino == 0) return 0;
+
+    char prefix[64];
+    int prefix_len = kvbfs_key_dirent_prefix(prefix, sizeof(prefix),
+                                              g_ctx->sessions_ino);
+
+    kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
+    int found = 0;
+    while (kv_iter_valid(iter)) {
+        size_t vlen;
+        const char *val = kv_iter_value(iter, &vlen);
+        if (vlen == sizeof(uint64_t)) {
+            uint64_t child_ino;
+            memcpy(&child_ino, val, sizeof(uint64_t));
+            if (child_ino == (uint64_t)ino) {
+                found = 1;
+                break;
+            }
+        }
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+    return found;
+}
+#endif
+
+static void kvbfs_poll_op(fuse_req_t req, fuse_ino_t ino,
+                          struct fuse_file_info *fi, struct fuse_pollhandle *ph)
+{
+    (void)fi;
+    (void)ino;
+
+#ifdef CFS_LOCAL_LLM
+    if (is_session_file(ino) && llm_gen_is_active(&g_ctx->llm, ino)) {
+        /* 正在生成中：注册 waiter，不报告就绪 */
+        if (ph)
+            llm_gen_add_waiter(&g_ctx->llm, ino, ph);
+        fuse_reply_poll(req, 0);
+        return;
+    }
+#endif
+
+    /* 普通文件或未在生成：立即就绪 */
+    if (ph)
+        fuse_pollhandle_destroy(ph);
+    fuse_reply_poll(req, POLLIN | POLLOUT);
+}
+
+static void kvbfs_ioctl_op(fuse_req_t req, fuse_ino_t ino, unsigned int cmd,
+                           void *arg, struct fuse_file_info *fi,
+                           unsigned flags, const void *in_buf, size_t in_bufsz,
+                           size_t out_bufsz)
+{
+    (void)arg;
+    (void)fi;
+    (void)in_buf;
+    (void)in_bufsz;
+
+#ifdef CFS_LOCAL_LLM
+    if (flags & FUSE_IOCTL_COMPAT) {
+        fuse_reply_err(req, ENOSYS);
+        return;
+    }
+
+    switch (cmd) {
+    case CFS_IOC_STATUS: {
+        if (out_bufsz < sizeof(struct cfs_status)) {
+            /* FUSE retry 协议：告诉内核我们需要的输出大小 */
+            struct iovec iov = { .iov_base = NULL, .iov_len = 0 };
+            struct iovec out_iov = { .iov_base = NULL,
+                                     .iov_len = sizeof(struct cfs_status) };
+            fuse_reply_ioctl_retry(req, &iov, 0, &out_iov, 1);
+            return;
+        }
+
+        struct cfs_status st = {0};
+        st.generating = llm_gen_is_active(&g_ctx->llm, ino) ? 1 : 0;
+        fuse_reply_ioctl(req, 0, &st, sizeof(st));
+        return;
+    }
+    case CFS_IOC_CANCEL:
+        fuse_reply_err(req, ENOSYS);
+        return;
+#ifdef CFS_MEMORY
+    case CFS_IOC_MEM_SEARCH: {
+        if (in_bufsz < sizeof(struct cfs_mem_query)) {
+            struct iovec in_iov = { .iov_base = NULL,
+                                    .iov_len = sizeof(struct cfs_mem_query) };
+            struct iovec out_iov = { .iov_base = NULL,
+                                     .iov_len = sizeof(struct cfs_mem_query) };
+            fuse_reply_ioctl_retry(req, &in_iov, 1, &out_iov, 1);
+            return;
+        }
+        if (out_bufsz < sizeof(struct cfs_mem_query)) {
+            struct iovec in_iov = { .iov_base = NULL,
+                                    .iov_len = sizeof(struct cfs_mem_query) };
+            struct iovec out_iov = { .iov_base = NULL,
+                                     .iov_len = sizeof(struct cfs_mem_query) };
+            fuse_reply_ioctl_retry(req, &in_iov, 1, &out_iov, 1);
+            return;
+        }
+
+        struct cfs_mem_query query;
+        memcpy(&query, in_buf, sizeof(query));
+        query.query_text[sizeof(query.query_text) - 1] = '\0';
+
+        int ret = mem_search(&g_ctx->mem, g_ctx->db, &query);
+        if (ret != 0) {
+            fuse_reply_err(req, EIO);
+            return;
+        }
+
+        fuse_reply_ioctl(req, 0, &query, sizeof(query));
+        return;
+    }
+#endif /* CFS_MEMORY */
+    default:
+        break;
+    }
+#else
+    (void)ino;
+    (void)cmd;
+    (void)flags;
+    (void)out_bufsz;
+#endif
+
+    fuse_reply_err(req, ENOTTY);
+}
+
 /* FUSE 操作表 */
 struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .init       = kvbfs_init,
@@ -1121,4 +1267,6 @@ struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .symlink    = kvbfs_symlink,
     .readlink   = kvbfs_readlink,
     .link       = kvbfs_link,
+    .poll       = kvbfs_poll_op,
+    .ioctl      = kvbfs_ioctl_op,
 };

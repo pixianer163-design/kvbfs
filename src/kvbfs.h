@@ -12,6 +12,14 @@
 
 #include "uthash.h"
 
+#ifdef CFS_LOCAL_LLM
+#include "llm.h"
+#endif
+
+#ifdef CFS_MEMORY
+#include "mem.h"
+#endif
+
 /* 配置常量 */
 #define KVBFS_BLOCK_SIZE    4096
 #define KVBFS_MAGIC         0x4B564246  /* "KVBF" */
@@ -53,6 +61,15 @@ struct kvbfs_ctx {
     pthread_mutex_t icache_lock;        /* 缓存表锁 */
     pthread_mutex_t alloc_lock;         /* inode 分配锁 */
     struct kvbfs_super super;           /* 超级块 */
+
+#ifdef CFS_LOCAL_LLM
+    struct llm_ctx llm;                 /* LLM 推理子系统 */
+    uint64_t sessions_ino;              /* /sessions 目录 inode 号 */
+#endif
+
+#ifdef CFS_MEMORY
+    struct mem_ctx mem;                 /* Memory/embedding subsystem */
+#endif
 };
 
 /* 全局上下文 */
@@ -82,5 +99,39 @@ static inline int kvbfs_key_dirent_prefix(char *buf, size_t buflen, uint64_t par
 {
     return snprintf(buf, buflen, "d:%lu:", (unsigned long)parent);
 }
+
+#ifdef CFS_LOCAL_LLM
+#include <sys/ioctl.h>
+
+struct cfs_status {
+    uint32_t generating;
+    uint32_t reserved;
+};
+
+#define CFS_IOC_MAGIC   'C'
+#define CFS_IOC_STATUS  _IOR(CFS_IOC_MAGIC, 1, struct cfs_status)
+#define CFS_IOC_CANCEL  _IO(CFS_IOC_MAGIC, 2)
+
+#ifdef CFS_MEMORY
+#define CFS_MEM_MAX_RESULTS  16
+#define CFS_MEM_SUMMARY_LEN  512
+
+struct cfs_mem_result {
+    uint64_t ino;
+    uint32_t seq;
+    float    score;
+    char     summary[CFS_MEM_SUMMARY_LEN];
+};
+
+struct cfs_mem_query {
+    char     query_text[512];
+    int      top_k;
+    int      n_results;
+    struct cfs_mem_result results[CFS_MEM_MAX_RESULTS];
+};
+
+#define CFS_IOC_MEM_SEARCH  _IOWR(CFS_IOC_MAGIC, 10, struct cfs_mem_query)
+#endif /* CFS_MEMORY */
+#endif /* CFS_LOCAL_LLM */
 
 #endif /* KVBFS_H */

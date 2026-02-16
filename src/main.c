@@ -6,6 +6,9 @@
 
 #include "kvbfs.h"
 #include "context.h"
+#ifdef CFS_LOCAL_LLM
+#include "llm.h"
+#endif
 
 struct kvbfs_ctx *g_ctx = NULL;
 
@@ -70,6 +73,62 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to initialize KVBFS\n");
         goto out1;
     }
+
+#ifdef CFS_LOCAL_LLM
+    {
+        const char *model_path = getenv("CFS_MODEL_PATH");
+        if (model_path) {
+            const char *s;
+            struct llm_config llm_cfg = {
+                .model_path = model_path,
+                .n_ctx = 4096,
+                .n_gpu_layers = 0,
+                .max_tokens = 512,
+                .temperature = 0.7f,
+            };
+            if ((s = getenv("CFS_N_CTX")))        llm_cfg.n_ctx = atoi(s);
+            if ((s = getenv("CFS_N_GPU_LAYERS")))  llm_cfg.n_gpu_layers = atoi(s);
+            if ((s = getenv("CFS_MAX_TOKENS")))    llm_cfg.max_tokens = atoi(s);
+            if ((s = getenv("CFS_TEMPERATURE")))   llm_cfg.temperature = (float)atof(s);
+
+            printf("  LLM model: %s\n", llm_cfg.model_path);
+            printf("  LLM n_ctx: %d, gpu_layers: %d, max_tokens: %d\n",
+                   llm_cfg.n_ctx, llm_cfg.n_gpu_layers, llm_cfg.max_tokens);
+
+            if (ctx_init_llm(g_ctx, &llm_cfg) != 0) {
+                fprintf(stderr, "Warning: LLM init failed, continuing without local inference\n");
+            }
+        } else {
+            printf("  LLM: disabled (CFS_MODEL_PATH not set)\n");
+        }
+    }
+#endif
+
+#ifdef CFS_MEMORY
+    {
+        const char *embed_path = getenv("CFS_EMBED_MODEL_PATH");
+        if (embed_path) {
+            const char *s;
+            struct mem_config mem_cfg = {
+                .embed_model_path = embed_path,
+                .n_ctx = 512,
+                .n_gpu_layers = 0,
+            };
+            if ((s = getenv("CFS_EMBED_N_CTX")))        mem_cfg.n_ctx = atoi(s);
+            if ((s = getenv("CFS_EMBED_N_GPU_LAYERS")))  mem_cfg.n_gpu_layers = atoi(s);
+
+            printf("  Embed model: %s\n", mem_cfg.embed_model_path);
+            printf("  Embed n_ctx: %d, gpu_layers: %d\n",
+                   mem_cfg.n_ctx, mem_cfg.n_gpu_layers);
+
+            if (ctx_init_mem(g_ctx, &mem_cfg) != 0) {
+                fprintf(stderr, "Warning: Memory subsystem init failed, continuing without embeddings\n");
+            }
+        } else {
+            printf("  Memory: disabled (CFS_EMBED_MODEL_PATH not set)\n");
+        }
+    }
+#endif
 
     /* 创建 FUSE session */
     se = fuse_session_new(&args, &kvbfs_ll_ops,
