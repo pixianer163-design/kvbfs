@@ -11,3 +11,9 @@ target_link_libraries(test_inode ${ROCKSDB_LIBRARIES} ${FUSE3_LIBRARIES} pthread
 target_include_directories(test_inode PRIVATE ${FUSE3_INCLUDE_DIRS})
 target_compile_definitions(test_inode PRIVATE FUSE_USE_VERSION=35 _FILE_OFFSET_BITS=64)
 add_test(NAME test_inode COMMAND test_inode)
+
+# 记忆 ioctl 搜索测试工具 (仅在 CFS_MEMORY 启用时构建)
+if(CFS_MEMORY)
+    add_executable(test_mem_ioctl test_mem_ioctl.c)
+    target_compile_definitions(test_mem_ioctl PRIVATE _FILE_OFFSET_BITS=64)
+endif()
