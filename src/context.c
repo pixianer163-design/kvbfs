@@ -148,6 +148,10 @@ int ctx_init_llm(struct kvbfs_ctx *ctx, const struct llm_config *config)
 #ifdef CFS_MEMORY
 int ctx_init_mem(struct kvbfs_ctx *ctx, const struct mem_config *config)
 {
+    if (events_init(&ctx->events) != 0) {
+        fprintf(stderr, "CFS: failed to initialize events subsystem\n");
+        return -1;
+    }
     return mem_init(&ctx->mem, config);
 }
 #endif
@@ -157,6 +161,7 @@ void ctx_destroy(struct kvbfs_ctx *ctx)
     if (!ctx) return;
 
 #ifdef CFS_MEMORY
+    events_destroy(&ctx->events);
     mem_destroy(&ctx->mem);
 #endif
 

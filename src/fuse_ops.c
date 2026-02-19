@@ -45,6 +45,20 @@ static void agentfs_ctl_stat(struct stat *st)
     st->st_ctim = st->st_atim;
 }
 
+static void agentfs_events_stat(struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_ino = AGENTFS_EVENTS_INO;
+    st->st_mode = S_IFREG | 0440;
+    st->st_nlink = 1;
+    st->st_size = 0;
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+    clock_gettime(CLOCK_REALTIME, &st->st_atim);
+    st->st_mtim = st->st_atim;
+    st->st_ctim = st->st_atim;
+}
+
 /* Resolve inode number to a path by walking dirent entries backwards */
 static int ino_to_path(uint64_t ino, char *buf, size_t buflen)
 {
@@ -351,6 +365,17 @@ static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         fuse_reply_entry(req, &e);
         return;
     }
+    /* Virtual .events file in root */
+    if (parent == KVBFS_ROOT_INO && strcmp(name, AGENTFS_EVENTS_NAME) == 0) {
+        struct fuse_entry_param e;
+        memset(&e, 0, sizeof(e));
+        e.ino = AGENTFS_EVENTS_INO;
+        e.attr_timeout = 0;
+        e.entry_timeout = 0;
+        agentfs_events_stat(&e.attr);
+        fuse_reply_entry(req, &e);
+        return;
+    }
 #endif
 
     uint64_t child_ino = dirent_lookup(parent, name);
@@ -391,6 +416,12 @@ static void kvbfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
         fuse_reply_attr(req, &st, 0);
         return;
     }
+    if (ino == AGENTFS_EVENTS_INO) {
+        struct stat st;
+        agentfs_events_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
 #endif
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
@@ -419,6 +450,12 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
         /* Virtual file: return current stat, ignore changes */
         struct stat st;
         agentfs_ctl_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
+    if (ino == AGENTFS_EVENTS_INO) {
+        struct stat st;
+        agentfs_events_stat(&st);
         fuse_reply_attr(req, &st, 0);
         return;
     }
@@ -502,6 +539,9 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     inode_sync(ic);
     inode_put(ic);
 
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_SETATTR, ino, NULL);
+#endif
     fuse_reply_attr(req, &st, 1.0);
 }
 
@@ -618,7 +658,7 @@ static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
     kv_iter_free(iter);
 
 #ifdef CFS_MEMORY
-    /* Append virtual .agentfs entry when listing root */
+    /* Append virtual .agentfs and .events entries when listing root */
     if (ino == KVBFS_ROOT_INO) {
         entry_idx++;
         if (entry_idx > off) {
@@ -626,6 +666,15 @@ static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
             agentfs_ctl_stat(&ctl_st);
             size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
                                                AGENTFS_CTL_NAME, &ctl_st, entry_idx + 1);
+            if (entsize <= size - buf_used)
+                buf_used += entsize;
+        }
+        entry_idx++;
+        if (entry_idx > off) {
+            struct stat evt_st;
+            agentfs_events_stat(&evt_st);
+            size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                               AGENTFS_EVENTS_NAME, &evt_st, entry_idx + 1);
             if (entsize <= size - buf_used)
                 buf_used += entsize;
         }
@@ -707,6 +756,10 @@ static void kvbfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mod
     inode_put(ic);
 
     fuse_reply_entry(req, &e);
+
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_MKDIR, e.ino, name);
+#endif
 }
 
 static void kvbfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -767,6 +820,9 @@ static void kvbfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
 #endif
     inode_delete(child_ino);
 
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_RMDIR, child_ino, name);
+#endif
     fuse_reply_err(req, 0);
 }
 
@@ -848,6 +904,10 @@ static void kvbfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
     inode_put(ic);
 
     fuse_reply_create(req, &e, fi);
+
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_CREATE, e.ino, name);
+#endif
 }
 
 static void kvbfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -916,6 +976,9 @@ static void kvbfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
     }
 #endif
 
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_UNLINK, child_ino, name);
+#endif
     fuse_reply_err(req, 0);
 }
 
@@ -930,6 +993,26 @@ static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
         }
         fi->fh = (uint64_t)(uintptr_t)ctl;
         fi->direct_io = 1;  /* bypass page cache for dynamic content */
+        fuse_reply_open(req, fi);
+        return;
+    }
+    if (ino == AGENTFS_EVENTS_INO) {
+        /* Read-only check */
+        if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+            fuse_reply_err(req, EACCES);
+            return;
+        }
+        struct events_fh *efh = calloc(1, sizeof(struct events_fh));
+        if (!efh) {
+            fuse_reply_err(req, ENOMEM);
+            return;
+        }
+        pthread_mutex_lock(&g_ctx->events.lock);
+        efh->start_seq = g_ctx->events.seq;
+        efh->read_pos = g_ctx->events.head;
+        pthread_mutex_unlock(&g_ctx->events.lock);
+        fi->fh = (uint64_t)(uintptr_t)efh;
+        fi->direct_io = 1;
         fuse_reply_open(req, fi);
         return;
     }
@@ -994,6 +1077,12 @@ static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
         fuse_reply_err(req, 0);
         return;
     }
+    if (ino == AGENTFS_EVENTS_INO) {
+        struct events_fh *efh = (struct events_fh *)(uintptr_t)fi->fh;
+        free(efh);
+        fuse_reply_err(req, 0);
+        return;
+    }
 #endif
 
     struct kvbfs_fh *fh = (struct kvbfs_fh *)(uintptr_t)fi->fh;
@@ -1010,6 +1099,7 @@ static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
         version_snapshot(fh->ino);
 #ifdef CFS_MEMORY
         mem_index_file(&g_ctx->mem, g_ctx->db, fh->ino);
+        events_emit(&g_ctx->events, EVT_WRITE, fh->ino, NULL);
 #endif
     }
 
@@ -1044,6 +1134,46 @@ static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
             if (size > avail) size = avail;
             fuse_reply_buf(req, ctl->result + off, size);
         }
+        return;
+    }
+    if (ino == AGENTFS_EVENTS_INO) {
+        struct events_fh *efh = (struct events_fh *)(uintptr_t)fi->fh;
+        if (!efh) {
+            fuse_reply_err(req, EIO);
+            return;
+        }
+
+        struct events_ctx *ectx = &g_ctx->events;
+        pthread_mutex_lock(&ectx->lock);
+
+        /* If read_pos has been overwritten by ring wraparound, advance to tail */
+        if (efh->read_pos < ectx->tail)
+            efh->read_pos = ectx->tail;
+
+        size_t avail = ectx->head - efh->read_pos;
+        if (avail == 0) {
+            pthread_mutex_unlock(&ectx->lock);
+            fuse_reply_buf(req, NULL, 0);
+            return;
+        }
+
+        if (size > avail) size = avail;
+
+        /* Copy from ring buffer (may wrap around) */
+        char *tmp = malloc(size);
+        if (!tmp) {
+            pthread_mutex_unlock(&ectx->lock);
+            fuse_reply_err(req, ENOMEM);
+            return;
+        }
+        for (size_t i = 0; i < size; i++)
+            tmp[i] = ectx->ring[(efh->read_pos + i) % EVENTS_RING_SIZE];
+        efh->read_pos += size;
+
+        pthread_mutex_unlock(&ectx->lock);
+
+        fuse_reply_buf(req, tmp, size);
+        free(tmp);
         return;
     }
 #endif
@@ -1118,6 +1248,10 @@ static void kvbfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
                         size_t size, off_t off, struct fuse_file_info *fi)
 {
 #ifdef CFS_MEMORY
+    if (ino == AGENTFS_EVENTS_INO) {
+        fuse_reply_err(req, EACCES);
+        return;
+    }
     if (ino == AGENTFS_CTL_INO) {
         struct agentfs_ctl_fh *ctl = (struct agentfs_ctl_fh *)(uintptr_t)fi->fh;
         if (!ctl) {
@@ -1338,6 +1472,9 @@ static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
         }
     }
 
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_RENAME, src_ino, newname);
+#endif
     fuse_reply_err(req, 0);
 }
 
@@ -1557,6 +1694,10 @@ static void kvbfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
     inode_put(ic);
 
     fuse_reply_entry(req, &e);
+
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_LINK, ino, newname);
+#endif
 }
 
 #ifdef CFS_LOCAL_LLM
@@ -1581,6 +1722,31 @@ static void kvbfs_poll_op(fuse_req_t req, fuse_ino_t ino,
 {
     (void)fi;
     (void)ino;
+
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_EVENTS_INO) {
+        struct events_fh *efh = (struct events_fh *)(uintptr_t)fi->fh;
+        struct events_ctx *ectx = &g_ctx->events;
+        pthread_mutex_lock(&ectx->lock);
+
+        int has_data = (efh && efh->read_pos < ectx->head);
+
+        if (has_data) {
+            if (ph) fuse_pollhandle_destroy(ph);
+            pthread_mutex_unlock(&ectx->lock);
+            fuse_reply_poll(req, POLLIN);
+        } else {
+            /* Register for notification */
+            if (ph) {
+                if (ectx->ph) fuse_pollhandle_destroy(ectx->ph);
+                ectx->ph = ph;
+            }
+            pthread_mutex_unlock(&ectx->lock);
+            fuse_reply_poll(req, 0);
+        }
+        return;
+    }
+#endif
 
 #ifdef CFS_LOCAL_LLM
     if (is_session_file(ino) && llm_gen_is_active(&g_ctx->llm, ino)) {
@@ -1686,7 +1852,9 @@ static void kvbfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
                             const char *value, size_t size, int flags)
 {
 #ifdef CFS_MEMORY
-    if (ino == AGENTFS_CTL_INO) { fuse_reply_err(req, ENOTSUP); return; }
+    if (ino == AGENTFS_CTL_INO || ino == AGENTFS_EVENTS_INO) {
+        fuse_reply_err(req, ENOTSUP); return;
+    }
 #endif
     /* Reject writes to virtual agentfs.* namespace */
     if (strncmp(name, "agentfs.", 8) == 0) {
@@ -1726,6 +1894,9 @@ static void kvbfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
         return;
     }
 
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_SETXATTR, ino, name);
+#endif
     fuse_reply_err(req, 0);
 }
 
@@ -1746,7 +1917,9 @@ static void kvbfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
                             size_t size)
 {
 #ifdef CFS_MEMORY
-    if (ino == AGENTFS_CTL_INO) { fuse_reply_err(req, ENOTSUP); return; }
+    if (ino == AGENTFS_CTL_INO || ino == AGENTFS_EVENTS_INO) {
+        fuse_reply_err(req, ENOTSUP); return;
+    }
 #endif
     /* Virtual xattr: agentfs.version → current version number as string */
     if (strcmp(name, "agentfs.version") == 0) {
@@ -1831,7 +2004,7 @@ static void kvbfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 static void kvbfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 {
 #ifdef CFS_MEMORY
-    if (ino == AGENTFS_CTL_INO) {
+    if (ino == AGENTFS_CTL_INO || ino == AGENTFS_EVENTS_INO) {
         if (size == 0) fuse_reply_xattr(req, 0);
         else fuse_reply_buf(req, NULL, 0);
         return;
@@ -1917,7 +2090,9 @@ static void kvbfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 static void kvbfs_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
 {
 #ifdef CFS_MEMORY
-    if (ino == AGENTFS_CTL_INO) { fuse_reply_err(req, ENOTSUP); return; }
+    if (ino == AGENTFS_CTL_INO || ino == AGENTFS_EVENTS_INO) {
+        fuse_reply_err(req, ENOTSUP); return;
+    }
 #endif
     if (strncmp(name, "agentfs.", 8) == 0) {
         fuse_reply_err(req, EPERM);
@@ -1945,6 +2120,9 @@ static void kvbfs_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
         return;
     }
 
+#ifdef CFS_MEMORY
+    events_emit(&g_ctx->events, EVT_REMOVEXATTR, ino, name);
+#endif
     fuse_reply_err(req, 0);
 }
 

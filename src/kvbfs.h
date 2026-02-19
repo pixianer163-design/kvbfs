@@ -18,6 +18,7 @@
 
 #ifdef CFS_MEMORY
 #include "mem.h"
+#include "events.h"
 #endif
 
 /* 配置常量 */
@@ -79,6 +80,7 @@ struct kvbfs_ctx {
 
 #ifdef CFS_MEMORY
     struct mem_ctx mem;                 /* Memory/embedding subsystem */
+    struct events_ctx events;           /* Event notification subsystem */
 #endif
 };
 

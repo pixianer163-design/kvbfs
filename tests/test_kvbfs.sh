@@ -772,6 +772,55 @@ else
 fi
 
 # ============================================================
+echo "--- Test 47: .events virtual file appears in root listing ---"
+LS_ROOT=$(ls -la "$MNT/" 2>/dev/null)
+if echo "$LS_ROOT" | grep -q '\.events'; then
+    pass ".events appears in root listing"
+else
+    fail ".events in root listing" "not found in: $(ls "$MNT/")"
+fi
+
+# ============================================================
+echo "--- Test 48: .events file stat ---"
+if [ -f "$MNT/.events" ]; then
+    pass ".events is a regular file"
+else
+    fail ".events stat" "not a regular file or does not exist"
+fi
+
+# ============================================================
+echo "--- Test 49: .events readable after file create ---"
+echo "events_test_data" > "$MNT/evt_test.txt" 2>/dev/null
+sleep 0.2
+EVT_DATA=$(cat "$MNT/.events" 2>/dev/null)
+if echo "$EVT_DATA" | grep -q '"create"'; then
+    pass ".events contains create event"
+else
+    fail ".events create event" "got: $EVT_DATA"
+fi
+
+# ============================================================
+echo "--- Test 50: .events readable after file write ---"
+echo "updated" > "$MNT/evt_test.txt" 2>/dev/null
+sleep 0.2
+EVT_DATA2=$(cat "$MNT/.events" 2>/dev/null)
+if echo "$EVT_DATA2" | grep -q '"write"'; then
+    pass ".events contains write event"
+else
+    fail ".events write event" "got: $EVT_DATA2"
+fi
+rm -f "$MNT/evt_test.txt" 2>/dev/null
+
+# ============================================================
+echo "--- Test 51: .events cannot be deleted ---"
+rm -f "$MNT/.events" 2>/dev/null
+if [ -f "$MNT/.events" ]; then
+    pass ".events survives rm attempt"
+else
+    fail ".events delete protection" "file was deleted"
+fi
+
+# ============================================================
 echo ""
 echo "========================================="
 echo -e "  ${GREEN}PASS: $PASS${NC}  ${RED}FAIL: $FAIL${NC}  ${YELLOW}SKIP: $SKIP${NC}"
