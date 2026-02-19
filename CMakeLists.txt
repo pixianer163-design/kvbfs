@@ -65,14 +65,45 @@ else()
     message(STATUS "CFS local LLM: disabled")
 endif()
 
-# Memory/embedding subsystem (requires CFS_LOCAL_LLM)
-option(CFS_MEMORY "Enable memory/embedding subsystem (requires CFS_LOCAL_LLM)" OFF)
-if(CFS_MEMORY AND NOT CFS_LOCAL_LLM)
-    message(FATAL_ERROR "CFS_MEMORY requires CFS_LOCAL_LLM")
-endif()
+# Memory/embedding subsystem (independent of CFS_LOCAL_LLM)
+option(CFS_MEMORY "Enable memory/embedding subsystem" OFF)
+
+set(MEM_SOURCES "")
+set(MEM_LIBS "")
+set(MEM_INCLUDE_DIRS "")
+set(MEM_DEFINITIONS "")
+set(MEM_LINK_DIRS "")
+
 if(CFS_MEMORY)
-    list(APPEND LLM_SOURCES src/mem.c)
-    list(APPEND LLM_DEFINITIONS CFS_MEMORY=1)
+    # llama.cpp is needed for embeddings — reuse LLAMA_DIR if set, else find independently
+    set(LLAMA_DIR "" CACHE PATH "Path to llama.cpp source tree")
+
+    if(NOT CFS_LOCAL_LLM)
+        # CFS_LOCAL_LLM already configured llama paths; only search if LLM is off
+        if(LLAMA_DIR)
+            set(MEM_INCLUDE_DIRS ${LLAMA_DIR}/include ${LLAMA_DIR}/ggml/include)
+            set(MEM_LINK_DIRS ${LLAMA_DIR}/build/bin)
+            set(MEM_LIBS llama ggml ggml-base ggml-cpu)
+        else()
+            pkg_check_modules(LLAMA_MEM llama)
+            if(LLAMA_MEM_FOUND)
+                set(MEM_INCLUDE_DIRS ${LLAMA_MEM_INCLUDE_DIRS})
+                set(MEM_LIBS ${LLAMA_MEM_LIBRARIES})
+            else()
+                find_path(LLAMA_H_DIR llama.h)
+                find_library(LLAMA_LIB llama)
+                if(LLAMA_H_DIR AND LLAMA_LIB)
+                    set(MEM_INCLUDE_DIRS ${LLAMA_H_DIR})
+                    set(MEM_LIBS ${LLAMA_LIB})
+                else()
+                    set(MEM_LIBS llama)
+                endif()
+            endif()
+        endif()
+    endif()
+
+    set(MEM_SOURCES src/mem.c src/events.c)
+    list(APPEND MEM_DEFINITIONS CFS_MEMORY=1)
     message(STATUS "CFS memory subsystem: enabled")
 else()
     message(STATUS "CFS memory subsystem: disabled")
@@ -84,6 +115,7 @@ include_directories(
     ${FUSE3_INCLUDE_DIRS}
     ${BACKEND_INCLUDE_DIRS}
     ${LLM_INCLUDE_DIRS}
+    ${MEM_INCLUDE_DIRS}
 )
 
 # 源文件
@@ -98,11 +130,15 @@ set(KVBFS_SOURCES
     src/version.c
     src/utils.c
     ${LLM_SOURCES}
+    ${MEM_SOURCES}
 )
 
 # 链接目录（用于本地 llama.cpp 构建）
 if(LLM_LINK_DIRS)
     link_directories(${LLM_LINK_DIRS})
+endif()
+if(MEM_LINK_DIRS)
+    link_directories(${MEM_LINK_DIRS})
 endif()
 
 # 主程序
@@ -112,6 +148,7 @@ target_link_libraries(kvbfs
     ${FUSE3_LIBRARIES}
     ${BACKEND_LIBS}
     ${LLM_LIBS}
+    ${MEM_LIBS}
     pthread
     m
 )
@@ -120,13 +157,22 @@ target_compile_definitions(kvbfs PRIVATE
     FUSE_USE_VERSION=35
     _FILE_OFFSET_BITS=64
     ${LLM_DEFINITIONS}
+    ${MEM_DEFINITIONS}
 )
 
 # 设置 RPATH 以便运行时找到本地 llama.cpp 库
+set(_RPATH_DIRS "")
 if(LLM_LINK_DIRS)
+    list(APPEND _RPATH_DIRS ${LLM_LINK_DIRS})
+endif()
+if(MEM_LINK_DIRS)
+    list(APPEND _RPATH_DIRS ${MEM_LINK_DIRS})
+endif()
+if(_RPATH_DIRS)
+    list(REMOVE_DUPLICATES _RPATH_DIRS)
     set_target_properties(kvbfs PROPERTIES
-        BUILD_RPATH "${LLM_LINK_DIRS}"
-        INSTALL_RPATH "${LLM_LINK_DIRS}"
+        BUILD_RPATH "${_RPATH_DIRS}"
+        INSTALL_RPATH "${_RPATH_DIRS}"
     )
 endif()
 

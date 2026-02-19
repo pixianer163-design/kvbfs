@@ -13,7 +13,9 @@ AgentFS 将传统文件系统语义与 Agent 友好的原语结合：自动版�
 | **自动版本快照** | 每次写入关闭时自动创建 CoW 快照，最多保留 64 个版本 |
 | **内容自动索引** | 文件关闭时自动检测文本、分块、生成 embedding 向量 |
 | **语义搜索** | 通过虚拟文件 `/.agentfs` 或 ioctl 接口进行自然语言搜索 |
+| **变更事件流** | 通过虚拟文件 `/.events` 实时流式获取文件系统变更（JSON Lines） |
 | **本地 LLM 推理** | 集成 llama.cpp，支持会话式对话推理（可选） |
+| **MCP Server** | 通过 MCP 协议为 AI Agent（如 Claude Code）提供文件系统工具 |
 | **FUSE lowlevel** | 高性能低级 FUSE 接口，支持多线程 |
 
 ## 快速开始
@@ -56,7 +58,7 @@ make -C build -j$(nproc)
 |------|--------|------|
 | `KVBFS_BACKEND` | `rocksdb` | KV 后端：`rocksdb` 或 `nvme` |
 | `CFS_LOCAL_LLM` | `OFF` | 启用 llama.cpp 本地 LLM 推理 |
-| `CFS_MEMORY` | `OFF` | 启用 embedding 记忆子系统（需要 `CFS_LOCAL_LLM`） |
+| `CFS_MEMORY` | `OFF` | 启用 embedding 记忆子系统（独立于 `CFS_LOCAL_LLM`，自动查找 llama.cpp） |
 | `LLAMA_DIR` | (空) | llama.cpp 源码路径（自动查找头文件和库） |
 | `BUILD_TESTS` | `OFF` | 构建测试 |
 
@@ -261,6 +263,30 @@ cat /tmp/kvbfs_mnt/.agentfs
 # {"status":"ready","usage":"Write a search query, then read results."}
 ```
 
+### 变更事件流 (`.events`)
+
+根目录下的虚拟文件 `/.events` 提供实时文件系统变更通知（JSON Lines 格式）：
+
+```bash
+# 打开 .events 后，所有后续文件操作会产生事件
+cat /tmp/kvbfs_mnt/.events
+```
+
+每行是一个 JSON 对象：
+
+```json
+{"seq":1,"type":"create","ino":42,"path":"readme.md","ts":1708300000}
+{"seq":2,"type":"write","ino":42,"path":"","ts":1708300001}
+```
+
+支持的事件类型：`create`, `write`, `unlink`, `mkdir`, `rmdir`, `rename`, `setattr`, `setxattr`, `removexattr`, `link`
+
+特性：
+- 256 KB 环形缓冲区，溢出时自动丢弃最旧事件
+- 每次 `open()` 从当前位置开始读取（不会看到打开之前的旧事件）
+- 只读文件，写入返回 `EACCES`
+- 支持 `poll()` 异步通知
+
 #### 通过 ioctl 搜索
 
 也可通过 ioctl 接口进行搜索（适合 C/C++ 程序）：
@@ -347,6 +373,7 @@ E2E 测试覆盖：
 | xattr 元数据 | 30-35 | 6 |
 | 版本快照 | 36-40 | 5 |
 | .agentfs 虚拟文件 | 41-46 | 6 |
+| .events 变更通知 | 47-51 | 5 |
 
 ## 架构
 
@@ -408,6 +435,46 @@ E2E 测试覆盖：
 | `KVBFS_KEY_MAX` | 512 | KV key 最大长度 |
 | `KVBFS_MAX_VERSIONS` | 64 | 每文件最大版本数 |
 | `AGENTFS_CTL_INO` | 0xFFFFFFFFFFFFFF | .agentfs 虚拟 inode |
+| `AGENTFS_EVENTS_INO` | 0xFFFFFFFFFFFFFE | .events 虚拟 inode |
+
+### MCP Server
+
+AgentFS 提供 MCP Server，让 Claude Code 等 AI Agent 通过 MCP 协议访问文件系统功能：
+
+```bash
+# 安装依赖
+cd cfs && pip install -r requirements.txt
+
+# 启动（stdio transport，适用于 Claude Code 集成）
+KVBFS_MOUNT=/tmp/kvbfs_mnt python cfs/mcp_server.py
+```
+
+提供以下 MCP 工具：
+
+| 工具 | 说明 |
+|------|------|
+| `semantic_search` | 语义搜索文件内容 |
+| `get_file_versions` | 获取文件版本历史 |
+| `get_file_metadata` | 获取文件 xattr 元数据 |
+| `set_file_metadata` | 设置文件 xattr |
+| `get_events` | 获取最近变更事件 |
+| `list_files` | 列出目录内容及元数据 |
+
+Claude Code 集成配置（`.claude/mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "agentfs": {
+      "command": "python",
+      "args": ["cfs/mcp_server.py"],
+      "env": {
+        "KVBFS_MOUNT": "/tmp/kvbfs_mnt"
+      }
+    }
+  }
+}
+```
 
 ## NVMe KV 模拟器
 
@@ -446,11 +513,12 @@ KVBFS/
 │   ├── kv_nvme.c           # NVMe TCP 客户端后端
 │   ├── llm.h / llm.c       # LLM 对话推理子系统
 │   ├── mem.h / mem.c       # Embedding 记忆子系统
+│   ├── events.h / events.c # 变更事件通知子系统
 │   ├── utils.c             # 工具函数
 │   ├── uthash.h            # 内嵌 hash 表库
 │   └── nvme_kv_proto.h     # NVMe KV 协议定义
 ├── sim/                    # NVMe KV 模拟器
-├── cfs/                    # CFS-Local Python 守护进程和 SDK
+├── cfs/                    # CFS-Local Python 守护进程、SDK 和 MCP Server
 ├── tests/
 │   ├── test_kvbfs.sh       # E2E 集成测试（48 项）
 │   ├── test_kv_store.c     # KV 存储单元测试
