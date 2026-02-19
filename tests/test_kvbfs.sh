@@ -447,6 +447,331 @@ rm -f "$MNT/linkdir/real.txt" 2>/dev/null
 rmdir "$MNT/linkdir" 2>/dev/null
 
 # ============================================================
+# xattr tests use Python os module (setfattr/getfattr may not be installed)
+echo "--- Test 30: Set and get xattr ---"
+echo "xattr test" > "$MNT/xa_file.txt" 2>/dev/null
+XA_RESULT=$(python3 -c "
+import os, sys
+f = '$MNT/xa_file.txt'
+try:
+    os.setxattr(f, 'user.status', b'done')
+    v = os.getxattr(f, 'user.status')
+    if v == b'done':
+        print('PASS')
+    else:
+        print('FAIL:got ' + repr(v))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$XA_RESULT" = "PASS" ]; then
+    pass "set and get xattr"
+else
+    fail "set and get xattr" "$XA_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 31: List xattrs ---"
+XA_RESULT=$(python3 -c "
+import os
+f = '$MNT/xa_file.txt'
+try:
+    os.setxattr(f, 'user.tag', b'important')
+    attrs = os.listxattr(f)
+    if 'user.status' in attrs and 'user.tag' in attrs:
+        print('PASS')
+    else:
+        print('FAIL:' + str(attrs))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$XA_RESULT" = "PASS" ]; then
+    pass "list xattrs"
+else
+    fail "list xattrs" "$XA_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 32: Remove xattr ---"
+XA_RESULT=$(python3 -c "
+import os
+f = '$MNT/xa_file.txt'
+try:
+    os.removexattr(f, 'user.tag')
+    attrs = os.listxattr(f)
+    if 'user.tag' not in attrs and 'user.status' in attrs:
+        print('PASS')
+    else:
+        print('FAIL:still in list ' + str(attrs))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$XA_RESULT" = "PASS" ]; then
+    pass "remove xattr"
+else
+    fail "remove xattr" "$XA_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 33: Get nonexistent xattr fails ---"
+XA_RESULT=$(python3 -c "
+import os
+f = '$MNT/xa_file.txt'
+try:
+    os.getxattr(f, 'user.nonexistent')
+    print('FAIL:should have raised')
+except OSError:
+    print('PASS')
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$XA_RESULT" = "PASS" ]; then
+    pass "get nonexistent xattr correctly returns error"
+else
+    fail "get nonexistent xattr" "$XA_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 34: Xattr survives file read ---"
+XA_RESULT=$(python3 -c "
+import os
+f = '$MNT/xa_file.txt'
+try:
+    v1 = os.getxattr(f, 'user.status')
+    with open(f) as fh: fh.read()  # trigger read
+    v2 = os.getxattr(f, 'user.status')
+    if v1 == v2:
+        print('PASS')
+    else:
+        print('FAIL:before=' + repr(v1) + ' after=' + repr(v2))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$XA_RESULT" = "PASS" ]; then
+    pass "xattr persists across reads"
+else
+    fail "xattr persistence" "$XA_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 35: Xattr cleaned up on file delete ---"
+rm -f "$MNT/xa_file.txt" 2>/dev/null
+echo "new" > "$MNT/xa_new.txt" 2>/dev/null
+XA_RESULT=$(python3 -c "
+import os
+f = '$MNT/xa_new.txt'
+try:
+    os.getxattr(f, 'user.status')
+    print('FAIL:xattr inherited')
+except OSError:
+    print('PASS')
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$XA_RESULT" = "PASS" ]; then
+    pass "xattr not inherited by new files"
+else
+    fail "xattr inherited by new file" "$XA_RESULT"
+fi
+rm -f "$MNT/xa_new.txt" 2>/dev/null
+
+# ============================================================
+echo "--- Test 36: Version snapshot on write ---"
+echo "version1" > "$MNT/ver_file.txt" 2>/dev/null
+VER_RESULT=$(python3 -c "
+import os, json
+f = '$MNT/ver_file.txt'
+try:
+    ver = os.getxattr(f, 'agentfs.version').decode()
+    if int(ver) >= 1:
+        print('PASS:' + ver)
+    else:
+        print('FAIL:ver=' + ver)
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if echo "$VER_RESULT" | grep -q "^PASS"; then
+    pass "version snapshot created (${VER_RESULT#PASS:})"
+else
+    fail "version snapshot" "$VER_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 37: Version increments on subsequent writes ---"
+echo "version2" > "$MNT/ver_file.txt" 2>/dev/null
+echo "version3" > "$MNT/ver_file.txt" 2>/dev/null
+VER_RESULT=$(python3 -c "
+import os
+f = '$MNT/ver_file.txt'
+try:
+    ver = int(os.getxattr(f, 'agentfs.version').decode())
+    if ver >= 3:
+        print('PASS:' + str(ver))
+    else:
+        print('FAIL:ver=' + str(ver))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if echo "$VER_RESULT" | grep -q "^PASS"; then
+    pass "version increments (${VER_RESULT#PASS:})"
+else
+    fail "version increments" "$VER_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 38: Version list contains metadata ---"
+VER_RESULT=$(python3 -c "
+import os, json
+f = '$MNT/ver_file.txt'
+try:
+    raw = os.getxattr(f, 'agentfs.versions').decode()
+    versions = json.loads(raw)
+    if len(versions) >= 2:
+        v = versions[-1]
+        if 'ver' in v and 'size' in v and 'mtime' in v:
+            print('PASS:count=' + str(len(versions)))
+        else:
+            print('FAIL:missing fields ' + str(v))
+    else:
+        print('FAIL:too few versions ' + str(len(versions)))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if echo "$VER_RESULT" | grep -q "^PASS"; then
+    pass "version list metadata (${VER_RESULT#PASS:})"
+else
+    fail "version list metadata" "$VER_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 39: agentfs.* xattrs are read-only ---"
+VER_RESULT=$(python3 -c "
+import os
+f = '$MNT/ver_file.txt'
+try:
+    os.setxattr(f, 'agentfs.version', b'999')
+    print('FAIL:should have raised')
+except OSError as e:
+    if e.errno == 1:  # EPERM
+        print('PASS')
+    else:
+        print('FAIL:wrong errno ' + str(e))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$VER_RESULT" = "PASS" ]; then
+    pass "agentfs.* xattrs are read-only"
+else
+    fail "agentfs.* read-only" "$VER_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 40: Version data cleaned up on delete ---"
+rm -f "$MNT/ver_file.txt" 2>/dev/null
+echo "fresh" > "$MNT/ver_fresh.txt" 2>/dev/null
+VER_RESULT=$(python3 -c "
+import os, json
+f = '$MNT/ver_fresh.txt'
+try:
+    ver = int(os.getxattr(f, 'agentfs.version').decode())
+    raw = os.getxattr(f, 'agentfs.versions').decode()
+    versions = json.loads(raw)
+    # New file has 1 version (its own write), not 3+ from deleted file
+    if ver == 1 and len(versions) == 1:
+        print('PASS')
+    else:
+        print('FAIL:ver=' + str(ver) + ' count=' + str(len(versions)))
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$VER_RESULT" = "PASS" ]; then
+    pass "old versions cleaned up, new file has ver=1"
+else
+    fail "version cleanup" "$VER_RESULT"
+fi
+rm -f "$MNT/ver_fresh.txt" 2>/dev/null
+
+# ============================================================
+echo "--- Test 41: .agentfs virtual file appears in root listing ---"
+LS_ROOT=$(ls -la "$MNT/" 2>/dev/null)
+if echo "$LS_ROOT" | grep -q '\.agentfs'; then
+    pass ".agentfs appears in root listing"
+else
+    fail ".agentfs in root listing" "not found in: $(ls "$MNT/")"
+fi
+
+# ============================================================
+echo "--- Test 42: .agentfs file stat ---"
+if [ -f "$MNT/.agentfs" ]; then
+    pass ".agentfs is a regular file"
+else
+    fail ".agentfs stat" "not a regular file or does not exist"
+fi
+
+# ============================================================
+echo "--- Test 43: .agentfs read without query returns usage ---"
+CTL_READ=$(cat "$MNT/.agentfs" 2>/dev/null)
+if echo "$CTL_READ" | grep -q '"status"'; then
+    pass ".agentfs read returns JSON with status"
+else
+    fail ".agentfs read" "unexpected: $CTL_READ"
+fi
+
+# ============================================================
+echo "--- Test 44: .agentfs write+read search cycle ---"
+# Write a query then read results (no embeddings loaded, so results should be empty or error)
+CTL_RESULT=$(python3 -c "
+import os
+try:
+    fd = os.open('$MNT/.agentfs', os.O_RDWR)
+    os.write(fd, b'test query')
+    # Seek back to start to read results
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = os.read(fd, 8192).decode()
+    os.close(fd)
+    import json
+    j = json.loads(data)
+    if 'status' in j:
+        print('PASS')
+    else:
+        print('FAIL:no status in response')
+except Exception as e:
+    print('FAIL:' + str(e))
+" 2>&1)
+if [ "$CTL_RESULT" = "PASS" ]; then
+    pass ".agentfs write+read returns JSON"
+else
+    fail ".agentfs write+read" "$CTL_RESULT"
+fi
+
+# ============================================================
+echo "--- Test 45: .agentfs cannot be deleted ---"
+rm -f "$MNT/.agentfs" 2>/dev/null
+if [ -f "$MNT/.agentfs" ]; then
+    pass ".agentfs survives rm attempt"
+else
+    fail ".agentfs delete protection" "file was deleted"
+fi
+
+# ============================================================
+echo "--- Test 46: .agentfs xattr operations return ENOTSUP ---"
+XATTR_RESULT=$(python3 -c "
+import os, errno
+try:
+    os.setxattr('$MNT/.agentfs', 'user.test', b'val')
+    print('FAIL:setxattr succeeded')
+except OSError as e:
+    if e.errno == errno.ENOTSUP or e.errno == errno.EOPNOTSUPP:
+        print('PASS')
+    else:
+        print('FAIL:wrong errno ' + str(e))
+" 2>&1)
+if [ "$XATTR_RESULT" = "PASS" ]; then
+    pass ".agentfs xattr returns ENOTSUP"
+else
+    fail ".agentfs xattr" "$XATTR_RESULT"
+fi
+
+# ============================================================
 echo ""
 echo "========================================="
 echo -e "  ${GREEN}PASS: $PASS${NC}  ${RED}FAIL: $FAIL${NC}  ${YELLOW}SKIP: $SKIP${NC}"

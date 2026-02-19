@@ -95,6 +95,7 @@ set(KVBFS_SOURCES
     src/inode.c
     src/super.c
     src/context.c
+    src/version.c
     src/utils.c
     ${LLM_SOURCES}
 )

@@ -12,8 +12,8 @@ uint64_t inode_alloc(void)
 {
     pthread_mutex_lock(&g_ctx->alloc_lock);
     uint64_t ino = g_ctx->super.next_ino++;
-    super_save(g_ctx);  /* 持久化 */
     pthread_mutex_unlock(&g_ctx->alloc_lock);
+    super_save(g_ctx);  /* I/O outside lock; crash wastes at most one ino */
     return ino;
 }
 
@@ -53,6 +53,10 @@ struct kvbfs_inode_cache *inode_get(uint64_t ino)
     pthread_mutex_lock(&g_ctx->icache_lock);
     HASH_FIND(hh, g_ctx->icache, &ino, sizeof(uint64_t), ic);
     if (ic) {
+        if (ic->deleted) {
+            pthread_mutex_unlock(&g_ctx->icache_lock);
+            return NULL;  /* deleted inode, treat as absent */
+        }
         ic->refcount++;
         pthread_mutex_unlock(&g_ctx->icache_lock);
         return ic;
@@ -76,10 +80,16 @@ struct kvbfs_inode_cache *inode_get(uint64_t ino)
 
     /* 加入缓存 */
     pthread_mutex_lock(&g_ctx->icache_lock);
-    /* 双重检查：可能其他线程已加载 */
+    /* 双重检查：可能其他线程已加载或已删除 */
     struct kvbfs_inode_cache *existing = NULL;
     HASH_FIND(hh, g_ctx->icache, &ino, sizeof(uint64_t), existing);
     if (existing) {
+        if (existing->deleted) {
+            pthread_mutex_unlock(&g_ctx->icache_lock);
+            pthread_rwlock_destroy(&ic->lock);
+            free(ic);
+            return NULL;
+        }
         existing->refcount++;
         pthread_mutex_unlock(&g_ctx->icache_lock);
         pthread_rwlock_destroy(&ic->lock);
@@ -100,7 +110,13 @@ void inode_put(struct kvbfs_inode_cache *ic)
     if (ic->refcount > 0) {
         ic->refcount--;
     }
-    /* 暂不从缓存移除，保留以便复用 */
+    if (ic->refcount == 0 && ic->deleted) {
+        HASH_DEL(g_ctx->icache, ic);
+        pthread_mutex_unlock(&g_ctx->icache_lock);
+        pthread_rwlock_destroy(&ic->lock);
+        free(ic);
+        return;
+    }
     pthread_mutex_unlock(&g_ctx->icache_lock);
 }
 
@@ -148,19 +164,20 @@ int inode_delete(uint64_t ino)
     char key[64];
     int keylen = kvbfs_key_inode(key, sizeof(key), ino);
 
-    /* 从缓存移除 */
+    /* Mark deleted; free immediately only if refcount == 0 */
     pthread_mutex_lock(&g_ctx->icache_lock);
     struct kvbfs_inode_cache *ic = NULL;
     HASH_FIND(hh, g_ctx->icache, &ino, sizeof(uint64_t), ic);
     if (ic) {
+        ic->deleted = true;
         if (ic->refcount == 0) {
             HASH_DEL(g_ctx->icache, ic);
+            pthread_mutex_unlock(&g_ctx->icache_lock);
             pthread_rwlock_destroy(&ic->lock);
             free(ic);
-        } else {
-            /* 仍有引用，仅从哈希表移除，标记为脏以防止复用 */
-            HASH_DEL(g_ctx->icache, ic);
+            return kv_delete(g_ctx->db, key, keylen);
         }
+        /* refcount > 0: keep in hash marked deleted; inode_put will clean up */
     }
     pthread_mutex_unlock(&g_ctx->icache_lock);
 
@@ -202,7 +219,7 @@ int inode_sync_all(void)
     pthread_mutex_lock(&g_ctx->icache_lock);
     struct kvbfs_inode_cache *ic, *tmp;
     HASH_ITER(hh, g_ctx->icache, ic, tmp) {
-        if (ic->dirty) {
+        if (ic->dirty && !ic->deleted) {
             ic->refcount++;
             if (count >= capacity) {
                 capacity *= 2;
@@ -240,6 +257,10 @@ void inode_cache_clear(void)
     pthread_mutex_lock(&g_ctx->icache_lock);
     struct kvbfs_inode_cache *ic, *tmp;
     HASH_ITER(hh, g_ctx->icache, ic, tmp) {
+        if (ic->refcount > 0) {
+            fprintf(stderr, "warning: inode %lu still has refcount %lu at cache clear\n",
+                    (unsigned long)ic->inode.ino, (unsigned long)ic->refcount);
+        }
         HASH_DEL(g_ctx->icache, ic);
         pthread_rwlock_destroy(&ic->lock);
         free(ic);

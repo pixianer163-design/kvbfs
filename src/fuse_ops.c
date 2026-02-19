@@ -1,6 +1,7 @@
 #include "kvbfs.h"
 #include "kv_store.h"
 #include "inode.h"
+#include "version.h"
 
 #include <string.h>
 #include <errno.h>
@@ -10,11 +11,225 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <poll.h>
+#include <sys/xattr.h>
 
 #ifdef CFS_LOCAL_LLM
 #include "llm.h"
 static int is_session_file(fuse_ino_t ino);
 #endif
+
+static void xattr_delete_all(uint64_t ino);
+
+/* ── Virtual .agentfs control file ───────────────────── */
+#ifdef CFS_MEMORY
+
+/* Per-open state for the .agentfs control file */
+struct agentfs_ctl_fh {
+    char  *query;        /* accumulated write data (query text) */
+    size_t query_len;
+    char  *result;       /* JSON result from search */
+    size_t result_len;
+};
+
+static void agentfs_ctl_stat(struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_ino = AGENTFS_CTL_INO;
+    st->st_mode = S_IFREG | 0660;
+    st->st_nlink = 1;
+    st->st_size = 0;
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+    clock_gettime(CLOCK_REALTIME, &st->st_atim);
+    st->st_mtim = st->st_atim;
+    st->st_ctim = st->st_atim;
+}
+
+/* Resolve inode number to a path by walking dirent entries backwards */
+static int ino_to_path(uint64_t ino, char *buf, size_t buflen)
+{
+    if (ino == KVBFS_ROOT_INO) {
+        if (buflen < 2) return -1;
+        buf[0] = '/';
+        buf[1] = '\0';
+        return 0;
+    }
+
+    /* Build path components by searching parent dirents */
+    char *components[128];
+    int depth = 0;
+    uint64_t cur = ino;
+
+    while (cur != KVBFS_ROOT_INO && depth < 128) {
+        /* Scan all dirent prefixes to find parent -> cur mapping */
+        bool found = false;
+        kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, "d:", 2);
+        while (kv_iter_valid(iter)) {
+            size_t vlen;
+            const char *val = kv_iter_value(iter, &vlen);
+            if (vlen == sizeof(uint64_t)) {
+                uint64_t child;
+                memcpy(&child, val, sizeof(uint64_t));
+                if (child == cur) {
+                    size_t klen;
+                    const char *key = kv_iter_key(iter, &klen);
+                    /* key = "d:<parent>:<name>" */
+                    const char *p = key + 2;  /* skip "d:" */
+                    const char *colon = memchr(p, ':', klen - 2);
+                    if (colon) {
+                        const char *name = colon + 1;
+                        size_t nlen = klen - (name - key);
+                        components[depth] = strndup(name, nlen);
+                        depth++;
+
+                        /* Parse parent ino */
+                        char parent_str[32];
+                        size_t plen = colon - p;
+                        if (plen >= sizeof(parent_str)) plen = sizeof(parent_str) - 1;
+                        memcpy(parent_str, p, plen);
+                        parent_str[plen] = '\0';
+                        cur = strtoull(parent_str, NULL, 10);
+                        found = true;
+                        kv_iter_free(iter);
+                        break;
+                    }
+                }
+            }
+            kv_iter_next(iter);
+        }
+        if (!found) {
+            kv_iter_free(iter);
+            break;
+        }
+    }
+
+    if (depth == 0) {
+        snprintf(buf, buflen, "ino:%lu", (unsigned long)ino);
+        return -1;
+    }
+
+    /* Build path from components (reverse order) */
+    size_t off = 0;
+    for (int i = depth - 1; i >= 0; i--) {
+        int n = snprintf(buf + off, buflen - off, "/%s", components[i]);
+        if (n < 0 || (size_t)n >= buflen - off) break;
+        off += n;
+    }
+    for (int i = 0; i < depth; i++) free(components[i]);
+    return 0;
+}
+
+/* Execute search query and format JSON results */
+static int agentfs_ctl_search(struct agentfs_ctl_fh *fh)
+{
+    if (!fh->query || fh->query_len == 0) {
+        /* No query — return usage info */
+        const char *usage =
+            "{\"status\":\"ready\",\"usage\":\"Write a search query, then read results.\"}\n";
+        fh->result = strdup(usage);
+        fh->result_len = strlen(usage);
+        return 0;
+    }
+
+    /* Null-terminate query */
+    char *q = malloc(fh->query_len + 1);
+    if (!q) return -1;
+    memcpy(q, fh->query, fh->query_len);
+    q[fh->query_len] = '\0';
+
+    /* Strip trailing whitespace/newline */
+    size_t qlen = fh->query_len;
+    while (qlen > 0 && (q[qlen - 1] == '\n' || q[qlen - 1] == '\r' ||
+                         q[qlen - 1] == ' '))
+        q[--qlen] = '\0';
+
+    if (qlen == 0) {
+        free(q);
+        const char *empty = "{\"status\":\"error\",\"message\":\"empty query\"}\n";
+        fh->result = strdup(empty);
+        fh->result_len = strlen(empty);
+        return 0;
+    }
+
+    /* Perform search */
+    struct cfs_mem_query query;
+    memset(&query, 0, sizeof(query));
+    strncpy(query.query_text, q, sizeof(query.query_text) - 1);
+    query.top_k = 10;
+    free(q);
+
+    int ret = mem_search(&g_ctx->mem, g_ctx->db, &query);
+    if (ret != 0) {
+        const char *err = "{\"status\":\"error\",\"message\":\"search failed\"}\n";
+        fh->result = strdup(err);
+        fh->result_len = strlen(err);
+        return 0;
+    }
+
+    /* Format JSON output */
+    size_t cap = 4096;
+    char *json = malloc(cap);
+    if (!json) return -1;
+
+    int off = snprintf(json, cap, "{\"status\":\"ok\",\"results\":[");
+
+    for (int i = 0; i < query.n_results; i++) {
+        struct cfs_mem_result *r = &query.results[i];
+
+        /* Resolve ino to path */
+        char path[CFS_MEM_PATH_LEN];
+        ino_to_path(r->ino, path, sizeof(path));
+
+        /* Escape summary for JSON (simple: replace " and \ and control chars) */
+        char escaped[CFS_MEM_SUMMARY_LEN * 2];
+        size_t ei = 0;
+        for (size_t si = 0; r->summary[si] && ei < sizeof(escaped) - 2; si++) {
+            char c = r->summary[si];
+            if (c == '"' || c == '\\') {
+                escaped[ei++] = '\\';
+                escaped[ei++] = c;
+            } else if (c == '\n') {
+                escaped[ei++] = '\\';
+                escaped[ei++] = 'n';
+            } else if (c == '\r') {
+                escaped[ei++] = '\\';
+                escaped[ei++] = 'r';
+            } else if (c == '\t') {
+                escaped[ei++] = '\\';
+                escaped[ei++] = 't';
+            } else if ((unsigned char)c >= 0x20) {
+                escaped[ei++] = c;
+            }
+        }
+        escaped[ei] = '\0';
+
+        /* Grow buffer if needed */
+        size_t needed = off + ei + 256 + strlen(path);
+        if (needed > cap) {
+            cap = needed * 2;
+            json = realloc(json, cap);
+            if (!json) return -1;
+        }
+
+        off += snprintf(json + off, cap - off,
+                        "%s{\"score\":%.4f,\"ino\":%lu,\"seq\":%u,"
+                        "\"path\":\"%s\",\"summary\":\"%s\"}",
+                        i > 0 ? "," : "",
+                        r->score,
+                        (unsigned long)r->ino,
+                        r->seq,
+                        path,
+                        escaped);
+    }
+
+    off += snprintf(json + off, cap - off, "]}\n");
+
+    fh->result = json;
+    fh->result_len = off;
+    return 0;
+}
+
+#endif /* CFS_MEMORY */
 
 /* FUSE lowlevel 操作实现 */
 
@@ -37,8 +252,9 @@ static void inode_to_stat(const struct kvbfs_inode *inode, struct stat *st)
 /* 查找目录项，返回子 inode 号，未找到返回 0 */
 static uint64_t dirent_lookup(uint64_t parent, const char *name)
 {
-    char key[256];
+    char key[KVBFS_KEY_MAX];
     int keylen = kvbfs_key_dirent(key, sizeof(key), parent, name);
+    if (keylen < 0) return 0;  /* key overflow */
 
     char *value = NULL;
     size_t value_len = 0;
@@ -58,8 +274,9 @@ static uint64_t dirent_lookup(uint64_t parent, const char *name)
 /* 添加目录项 */
 static int dirent_add(uint64_t parent, const char *name, uint64_t child)
 {
-    char key[256];
+    char key[KVBFS_KEY_MAX];
     int keylen = kvbfs_key_dirent(key, sizeof(key), parent, name);
+    if (keylen < 0) return -1;  /* key overflow */
 
     return kv_put(g_ctx->db, key, keylen,
                   (const char *)&child, sizeof(uint64_t));
@@ -68,8 +285,9 @@ static int dirent_add(uint64_t parent, const char *name, uint64_t child)
 /* 删除目录项 */
 static int dirent_remove(uint64_t parent, const char *name)
 {
-    char key[256];
+    char key[KVBFS_KEY_MAX];
     int keylen = kvbfs_key_dirent(key, sizeof(key), parent, name);
+    if (keylen < 0) return -1;  /* key overflow */
 
     return kv_delete(g_ctx->db, key, keylen);
 }
@@ -121,6 +339,20 @@ static void kvbfs_destroy(void *userdata)
 
 static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
+#ifdef CFS_MEMORY
+    /* Virtual .agentfs control file in root */
+    if (parent == KVBFS_ROOT_INO && strcmp(name, AGENTFS_CTL_NAME) == 0) {
+        struct fuse_entry_param e;
+        memset(&e, 0, sizeof(e));
+        e.ino = AGENTFS_CTL_INO;
+        e.attr_timeout = 0;
+        e.entry_timeout = 0;
+        agentfs_ctl_stat(&e.attr);
+        fuse_reply_entry(req, &e);
+        return;
+    }
+#endif
+
     uint64_t child_ino = dirent_lookup(parent, name);
     if (child_ino == 0) {
         fuse_reply_err(req, ENOENT);
@@ -152,6 +384,15 @@ static void kvbfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 {
     (void)fi;
 
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        struct stat st;
+        agentfs_ctl_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
+#endif
+
     struct kvbfs_inode_cache *ic = inode_get(ino);
     if (!ic) {
         fuse_reply_err(req, ENOENT);
@@ -172,6 +413,16 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
                           int to_set, struct fuse_file_info *fi)
 {
     (void)fi;
+
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        /* Virtual file: return current stat, ignore changes */
+        struct stat st;
+        agentfs_ctl_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
+#endif
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
     if (!ic) {
@@ -366,6 +617,21 @@ static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
     }
     kv_iter_free(iter);
 
+#ifdef CFS_MEMORY
+    /* Append virtual .agentfs entry when listing root */
+    if (ino == KVBFS_ROOT_INO) {
+        entry_idx++;
+        if (entry_idx > off) {
+            struct stat ctl_st;
+            agentfs_ctl_stat(&ctl_st);
+            size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                               AGENTFS_CTL_NAME, &ctl_st, entry_idx + 1);
+            if (entsize <= size - buf_used)
+                buf_used += entsize;
+        }
+    }
+#endif
+
 done:
     fuse_reply_buf(req, buf, buf_used);
     free(buf);
@@ -494,6 +760,11 @@ static void kvbfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
 
     /* 删除 inode */
     inode_put(ic);
+    xattr_delete_all(child_ino);
+    version_delete_all(child_ino);
+#ifdef CFS_MEMORY
+    mem_delete_embeddings(g_ctx->db, child_ino);
+#endif
     inode_delete(child_ino);
 
     fuse_reply_err(req, 0);
@@ -540,6 +811,19 @@ static void kvbfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
         return;
     }
 
+#ifdef CFS_LOCAL_LLM
+    /* Track new session files in O(1) hash set */
+    if (parent == g_ctx->sessions_ino) {
+        struct session_ino_entry *entry = malloc(sizeof(*entry));
+        if (entry) {
+            entry->ino = ic->inode.ino;
+            pthread_mutex_lock(&g_ctx->session_lock);
+            HASH_ADD(hh, g_ctx->session_set, ino, sizeof(uint64_t), entry);
+            pthread_mutex_unlock(&g_ctx->session_lock);
+        }
+    }
+#endif
+
     /* 返回新文件信息 */
     struct fuse_entry_param e;
     memset(&e, 0, sizeof(e));
@@ -550,6 +834,16 @@ static void kvbfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
     pthread_rwlock_rdlock(&ic->lock);
     inode_to_stat(&ic->inode, &e.attr);
     pthread_rwlock_unlock(&ic->lock);
+
+    /* Allocate per-open file handle for write tracking */
+    {
+        struct kvbfs_fh *fh = calloc(1, sizeof(struct kvbfs_fh));
+        if (fh) {
+            fh->ino = ic->inode.ino;
+            fh->written = false;
+        }
+        fi->fh = (uint64_t)(uintptr_t)fh;
+    }
 
     inode_put(ic);
 
@@ -599,14 +893,48 @@ static void kvbfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 
     if (should_delete) {
         delete_file_blocks(child_ino, blocks);
+        xattr_delete_all(child_ino);
+        version_delete_all(child_ino);
+#ifdef CFS_MEMORY
+        mem_delete_embeddings(g_ctx->db, child_ino);
+#endif
         inode_delete(child_ino);
     }
+
+#ifdef CFS_LOCAL_LLM
+    /* Remove from session hash set if parent is /sessions */
+    if (parent == g_ctx->sessions_ino) {
+        uint64_t key = child_ino;
+        struct session_ino_entry *entry = NULL;
+        pthread_mutex_lock(&g_ctx->session_lock);
+        HASH_FIND(hh, g_ctx->session_set, &key, sizeof(uint64_t), entry);
+        if (entry) {
+            HASH_DEL(g_ctx->session_set, entry);
+            free(entry);
+        }
+        pthread_mutex_unlock(&g_ctx->session_lock);
+    }
+#endif
 
     fuse_reply_err(req, 0);
 }
 
 static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        struct agentfs_ctl_fh *ctl = calloc(1, sizeof(struct agentfs_ctl_fh));
+        if (!ctl) {
+            fuse_reply_err(req, ENOMEM);
+            return;
+        }
+        fi->fh = (uint64_t)(uintptr_t)ctl;
+        fi->direct_io = 1;  /* bypass page cache for dynamic content */
+        fuse_reply_open(req, fi);
+        return;
+    }
+#endif
+
     struct kvbfs_inode_cache *ic = inode_get(ino);
     if (!ic) {
         fuse_reply_err(req, ENOENT);
@@ -642,12 +970,33 @@ static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 
     inode_put(ic);
 
+    /* Allocate per-open file handle for write tracking */
+    struct kvbfs_fh *fh = calloc(1, sizeof(struct kvbfs_fh));
+    if (fh) {
+        fh->ino = ino;
+        fh->written = (fi->flags & O_TRUNC) ? true : false;
+    }
+    fi->fh = (uint64_t)(uintptr_t)fh;
+
     fuse_reply_open(req, fi);
 }
 
 static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void)fi;
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        struct agentfs_ctl_fh *ctl = (struct agentfs_ctl_fh *)(uintptr_t)fi->fh;
+        if (ctl) {
+            free(ctl->query);
+            free(ctl->result);
+            free(ctl);
+        }
+        fuse_reply_err(req, 0);
+        return;
+    }
+#endif
+
+    struct kvbfs_fh *fh = (struct kvbfs_fh *)(uintptr_t)fi->fh;
 
 #ifdef CFS_LOCAL_LLM
     /* 如果文件在 /sessions 目录下且可写打开，尝试触发推理 */
@@ -657,12 +1006,48 @@ static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
     (void)ino;
 #endif
 
+    if (fh && fh->written) {
+        version_snapshot(fh->ino);
+#ifdef CFS_MEMORY
+        mem_index_file(&g_ctx->mem, g_ctx->db, fh->ino);
+#endif
+    }
+
+    free(fh);
     fuse_reply_err(req, 0);
 }
 
 static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
                        off_t off, struct fuse_file_info *fi)
 {
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        struct agentfs_ctl_fh *ctl = (struct agentfs_ctl_fh *)(uintptr_t)fi->fh;
+        if (!ctl) {
+            fuse_reply_err(req, EIO);
+            return;
+        }
+
+        /* Execute search on first read if results not yet generated */
+        if (!ctl->result) {
+            if (agentfs_ctl_search(ctl) != 0) {
+                fuse_reply_err(req, EIO);
+                return;
+            }
+        }
+
+        /* Return data from result buffer at offset */
+        if ((size_t)off >= ctl->result_len) {
+            fuse_reply_buf(req, NULL, 0);
+        } else {
+            size_t avail = ctl->result_len - off;
+            if (size > avail) size = avail;
+            fuse_reply_buf(req, ctl->result + off, size);
+        }
+        return;
+    }
+#endif
+
     (void)fi;
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
@@ -732,7 +1117,36 @@ static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 static void kvbfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
                         size_t size, off_t off, struct fuse_file_info *fi)
 {
-    (void)fi;
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        struct agentfs_ctl_fh *ctl = (struct agentfs_ctl_fh *)(uintptr_t)fi->fh;
+        if (!ctl) {
+            fuse_reply_err(req, EIO);
+            return;
+        }
+        /* Accumulate query data; clear any previous results */
+        free(ctl->result);
+        ctl->result = NULL;
+        ctl->result_len = 0;
+
+        char *newq = realloc(ctl->query, ctl->query_len + size);
+        if (!newq) {
+            fuse_reply_err(req, ENOMEM);
+            return;
+        }
+        memcpy(newq + ctl->query_len, buf, size);
+        ctl->query = newq;
+        ctl->query_len += size;
+        (void)off;
+
+        fuse_reply_write(req, size);
+        return;
+    }
+#endif
+
+    /* Mark file handle as written */
+    struct kvbfs_fh *fh = (struct kvbfs_fh *)(uintptr_t)fi->fh;
+    if (fh) fh->written = true;
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
     if (!ic) {
@@ -842,6 +1256,11 @@ static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
                     inode_put(np_ic);
                 }
             }
+            xattr_delete_all(dst_ino);
+            version_delete_all(dst_ino);
+#ifdef CFS_MEMORY
+            mem_delete_embeddings(g_ctx->db, dst_ino);
+#endif
             inode_delete(dst_ino);
         }
     }
@@ -869,6 +1288,34 @@ static void kvbfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
         fuse_reply_err(req, EIO);
         return;
     }
+
+#ifdef CFS_LOCAL_LLM
+    /* Maintain session hash set on rename across /sessions boundary */
+    if (parent != newparent) {
+        if (parent == g_ctx->sessions_ino) {
+            /* Moved out of /sessions: remove from set */
+            uint64_t key = src_ino;
+            struct session_ino_entry *entry = NULL;
+            pthread_mutex_lock(&g_ctx->session_lock);
+            HASH_FIND(hh, g_ctx->session_set, &key, sizeof(uint64_t), entry);
+            if (entry) {
+                HASH_DEL(g_ctx->session_set, entry);
+                free(entry);
+            }
+            pthread_mutex_unlock(&g_ctx->session_lock);
+        }
+        if (newparent == g_ctx->sessions_ino) {
+            /* Moved into /sessions: add to set */
+            struct session_ino_entry *entry = malloc(sizeof(*entry));
+            if (entry) {
+                entry->ino = src_ino;
+                pthread_mutex_lock(&g_ctx->session_lock);
+                HASH_ADD(hh, g_ctx->session_set, ino, sizeof(uint64_t), entry);
+                pthread_mutex_unlock(&g_ctx->session_lock);
+            }
+        }
+    }
+#endif
 
     /* 如果是目录且跨目录移动，更新父目录 nlink */
     if (src_is_dir && parent != newparent) {
@@ -1113,32 +1560,19 @@ static void kvbfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
 }
 
 #ifdef CFS_LOCAL_LLM
-/* 检查 ino 是否是 /sessions 目录下的文件 */
+/* 检查 ino 是否是 /sessions 目录下的文件 (O(1) hash lookup) */
 static int is_session_file(fuse_ino_t ino)
 {
     if (g_ctx->sessions_ino == 0) return 0;
 
-    char prefix[64];
-    int prefix_len = kvbfs_key_dirent_prefix(prefix, sizeof(prefix),
-                                              g_ctx->sessions_ino);
+    uint64_t key = (uint64_t)ino;
+    struct session_ino_entry *entry = NULL;
 
-    kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
-    int found = 0;
-    while (kv_iter_valid(iter)) {
-        size_t vlen;
-        const char *val = kv_iter_value(iter, &vlen);
-        if (vlen == sizeof(uint64_t)) {
-            uint64_t child_ino;
-            memcpy(&child_ino, val, sizeof(uint64_t));
-            if (child_ino == (uint64_t)ino) {
-                found = 1;
-                break;
-            }
-        }
-        kv_iter_next(iter);
-    }
-    kv_iter_free(iter);
-    return found;
+    pthread_mutex_lock(&g_ctx->session_lock);
+    HASH_FIND(hh, g_ctx->session_set, &key, sizeof(uint64_t), entry);
+    pthread_mutex_unlock(&g_ctx->session_lock);
+
+    return entry != NULL;
 }
 #endif
 
@@ -1171,19 +1605,17 @@ static void kvbfs_ioctl_op(fuse_req_t req, fuse_ino_t ino, unsigned int cmd,
 {
     (void)arg;
     (void)fi;
-    (void)in_buf;
-    (void)in_bufsz;
 
-#ifdef CFS_LOCAL_LLM
+#if defined(CFS_LOCAL_LLM) || defined(CFS_MEMORY)
     if (flags & FUSE_IOCTL_COMPAT) {
         fuse_reply_err(req, ENOSYS);
         return;
     }
 
     switch (cmd) {
+#ifdef CFS_LOCAL_LLM
     case CFS_IOC_STATUS: {
         if (out_bufsz < sizeof(struct cfs_status)) {
-            /* FUSE retry 协议：告诉内核我们需要的输出大小 */
             struct iovec iov = { .iov_base = NULL, .iov_len = 0 };
             struct iovec out_iov = { .iov_base = NULL,
                                      .iov_len = sizeof(struct cfs_status) };
@@ -1199,6 +1631,7 @@ static void kvbfs_ioctl_op(fuse_req_t req, fuse_ino_t ino, unsigned int cmd,
     case CFS_IOC_CANCEL:
         fuse_reply_err(req, ENOSYS);
         return;
+#endif /* CFS_LOCAL_LLM */
 #ifdef CFS_MEMORY
     case CFS_IOC_MEM_SEARCH: {
         if (in_bufsz < sizeof(struct cfs_mem_query)) {
@@ -1239,10 +1672,296 @@ static void kvbfs_ioctl_op(fuse_req_t req, fuse_ino_t ino, unsigned int cmd,
     (void)ino;
     (void)cmd;
     (void)flags;
+    (void)in_buf;
+    (void)in_bufsz;
     (void)out_bufsz;
 #endif
 
     fuse_reply_err(req, ENOTTY);
+}
+
+/* ---- xattr operations ---- */
+
+static void kvbfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+                            const char *value, size_t size, int flags)
+{
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) { fuse_reply_err(req, ENOTSUP); return; }
+#endif
+    /* Reject writes to virtual agentfs.* namespace */
+    if (strncmp(name, "agentfs.", 8) == 0) {
+        fuse_reply_err(req, EPERM);
+        return;
+    }
+
+    char key[KVBFS_KEY_MAX];
+    int keylen = kvbfs_key_xattr(key, sizeof(key), ino, name);
+    if (keylen < 0) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+
+    if (flags & XATTR_CREATE) {
+        /* Must not already exist */
+        char *existing = NULL;
+        size_t elen = 0;
+        if (kv_get(g_ctx->db, key, keylen, &existing, &elen) == 0) {
+            free(existing);
+            fuse_reply_err(req, EEXIST);
+            return;
+        }
+    } else if (flags & XATTR_REPLACE) {
+        /* Must already exist */
+        char *existing = NULL;
+        size_t elen = 0;
+        if (kv_get(g_ctx->db, key, keylen, &existing, &elen) != 0) {
+            fuse_reply_err(req, ENODATA);
+            return;
+        }
+        free(existing);
+    }
+
+    if (kv_put(g_ctx->db, key, keylen, value, size) != 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    fuse_reply_err(req, 0);
+}
+
+/* Helper: reply with a dynamically generated xattr value */
+static void reply_virtual_xattr(fuse_req_t req, size_t size,
+                                 const char *data, size_t dlen)
+{
+    if (size == 0) {
+        fuse_reply_xattr(req, dlen);
+    } else if (size < dlen) {
+        fuse_reply_err(req, ERANGE);
+    } else {
+        fuse_reply_buf(req, data, dlen);
+    }
+}
+
+static void kvbfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+                            size_t size)
+{
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) { fuse_reply_err(req, ENOTSUP); return; }
+#endif
+    /* Virtual xattr: agentfs.version → current version number as string */
+    if (strcmp(name, "agentfs.version") == 0) {
+        uint64_t ver = version_get_current(ino);
+        char buf[24];
+        int n = snprintf(buf, sizeof(buf), "%lu", (unsigned long)ver);
+        reply_virtual_xattr(req, size, buf, n);
+        return;
+    }
+
+    /* Virtual xattr: agentfs.versions → JSON array of version metadata */
+    if (strcmp(name, "agentfs.versions") == 0) {
+        uint64_t ver = version_get_current(ino);
+        if (ver == 0) {
+            reply_virtual_xattr(req, size, "[]", 2);
+            return;
+        }
+
+        /* Build JSON array */
+        size_t cap = 256;
+        char *json = malloc(cap);
+        if (!json) { fuse_reply_err(req, ENOMEM); return; }
+        size_t off = 0;
+        json[off++] = '[';
+
+        uint64_t start = 0;
+        if (ver > KVBFS_MAX_VERSIONS) start = ver - KVBFS_MAX_VERSIONS;
+
+        for (uint64_t v = start; v < ver; v++) {
+            struct kvbfs_version_meta meta;
+            if (version_get_meta(ino, v, &meta) != 0) continue;
+
+            char entry[128];
+            int elen = snprintf(entry, sizeof(entry),
+                "%s{\"ver\":%lu,\"size\":%lu,\"mtime\":%lu}",
+                (off > 1) ? "," : "",
+                (unsigned long)v,
+                (unsigned long)meta.size,
+                (unsigned long)meta.mtime.tv_sec);
+
+            while (off + elen + 2 > cap) {
+                cap *= 2;
+                char *tmp = realloc(json, cap);
+                if (!tmp) { free(json); fuse_reply_err(req, ENOMEM); return; }
+                json = tmp;
+            }
+            memcpy(json + off, entry, elen);
+            off += elen;
+        }
+        json[off++] = ']';
+
+        reply_virtual_xattr(req, size, json, off);
+        free(json);
+        return;
+    }
+
+    /* Regular user xattr from KV store */
+    char key[KVBFS_KEY_MAX];
+    int keylen = kvbfs_key_xattr(key, sizeof(key), ino, name);
+    if (keylen < 0) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+
+    char *value = NULL;
+    size_t vlen = 0;
+    if (kv_get(g_ctx->db, key, keylen, &value, &vlen) != 0) {
+        fuse_reply_err(req, ENODATA);
+        return;
+    }
+
+    if (size == 0) {
+        fuse_reply_xattr(req, vlen);
+    } else if (size < vlen) {
+        fuse_reply_err(req, ERANGE);
+    } else {
+        fuse_reply_buf(req, value, vlen);
+    }
+    free(value);
+}
+
+static void kvbfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
+{
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) {
+        if (size == 0) fuse_reply_xattr(req, 0);
+        else fuse_reply_buf(req, NULL, 0);
+        return;
+    }
+#endif
+    char prefix[64];
+    int prefix_len = kvbfs_key_xattr_prefix(prefix, sizeof(prefix), ino);
+
+    /* First pass: collect all xattr names and total size */
+    size_t total = 0;
+    size_t count = 0;
+    size_t cap = 16;
+    char **names = malloc(cap * sizeof(char *));
+    size_t *name_lens = malloc(cap * sizeof(size_t));
+    if (!names || !name_lens) {
+        free(names);
+        free(name_lens);
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+
+    kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
+    while (kv_iter_valid(iter)) {
+        size_t klen;
+        const char *raw_key = kv_iter_key(iter, &klen);
+
+        /* Extract attr name: skip "x:<ino>:" prefix */
+        const char *attr_name = raw_key + prefix_len;
+        size_t attr_len = klen - prefix_len;
+
+        if (count >= cap) {
+            cap *= 2;
+            names = realloc(names, cap * sizeof(char *));
+            name_lens = realloc(name_lens, cap * sizeof(size_t));
+            if (!names || !name_lens) {
+                kv_iter_free(iter);
+                free(names);
+                free(name_lens);
+                fuse_reply_err(req, ENOMEM);
+                return;
+            }
+        }
+
+        names[count] = strndup(attr_name, attr_len);
+        name_lens[count] = attr_len;
+        total += attr_len + 1;  /* name + null terminator */
+        count++;
+
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+
+    if (size == 0) {
+        /* Return total size needed */
+        fuse_reply_xattr(req, total);
+    } else if (size < total) {
+        fuse_reply_err(req, ERANGE);
+    } else {
+        /* Build null-separated name list */
+        char *buf = malloc(total);
+        if (!buf) {
+            for (size_t i = 0; i < count; i++) free(names[i]);
+            free(names);
+            free(name_lens);
+            fuse_reply_err(req, ENOMEM);
+            return;
+        }
+        size_t off = 0;
+        for (size_t i = 0; i < count; i++) {
+            memcpy(buf + off, names[i], name_lens[i]);
+            off += name_lens[i];
+            buf[off++] = '\0';
+        }
+        fuse_reply_buf(req, buf, total);
+        free(buf);
+    }
+
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+    free(name_lens);
+}
+
+static void kvbfs_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
+{
+#ifdef CFS_MEMORY
+    if (ino == AGENTFS_CTL_INO) { fuse_reply_err(req, ENOTSUP); return; }
+#endif
+    if (strncmp(name, "agentfs.", 8) == 0) {
+        fuse_reply_err(req, EPERM);
+        return;
+    }
+
+    char key[KVBFS_KEY_MAX];
+    int keylen = kvbfs_key_xattr(key, sizeof(key), ino, name);
+    if (keylen < 0) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+
+    /* Check existence first */
+    char *value = NULL;
+    size_t vlen = 0;
+    if (kv_get(g_ctx->db, key, keylen, &value, &vlen) != 0) {
+        fuse_reply_err(req, ENODATA);
+        return;
+    }
+    free(value);
+
+    if (kv_delete(g_ctx->db, key, keylen) != 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    fuse_reply_err(req, 0);
+}
+
+/* Helper: delete all xattrs for an inode */
+static void xattr_delete_all(uint64_t ino)
+{
+    char prefix[64];
+    int prefix_len = kvbfs_key_xattr_prefix(prefix, sizeof(prefix), ino);
+
+    kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
+    while (kv_iter_valid(iter)) {
+        size_t klen;
+        const char *key = kv_iter_key(iter, &klen);
+        kv_delete(g_ctx->db, key, klen);
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
 }
 
 /* FUSE 操作表 */
@@ -1269,4 +1988,8 @@ struct fuse_lowlevel_ops kvbfs_ll_ops = {
     .link       = kvbfs_link,
     .poll       = kvbfs_poll_op,
     .ioctl      = kvbfs_ioctl_op,
+    .setxattr   = kvbfs_setxattr,
+    .getxattr   = kvbfs_getxattr,
+    .listxattr  = kvbfs_listxattr,
+    .removexattr = kvbfs_removexattr,
 };

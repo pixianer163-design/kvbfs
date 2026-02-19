@@ -3,6 +3,7 @@
 #include "mem.h"
 #include "kvbfs.h"
 #include "kv_store.h"
+#include "inode.h"
 
 #include <llama.h>
 #include <stdlib.h>
@@ -226,6 +227,174 @@ static int mem_store_embedding(struct mem_ctx *mem, void *db, uint64_t ino,
 
     printf("MEM: stored embedding ino=%lu seq=%u role=%s len=%d\n",
            (unsigned long)ino, seq, role ? role : "?", text_len);
+    return 0;
+}
+
+/* ── Delete all embeddings for an inode ───────────────── */
+
+void mem_delete_embeddings(void *db, uint64_t ino)
+{
+    char prefix[64];
+    int plen;
+
+    /* Delete vectors: m:v:<ino>: */
+    plen = snprintf(prefix, sizeof(prefix), "m:v:%lu:", (unsigned long)ino);
+    kv_iterator_t *iter = kv_iter_prefix(db, prefix, plen);
+    while (kv_iter_valid(iter)) {
+        size_t klen;
+        const char *k = kv_iter_key(iter, &klen);
+        kv_delete(db, k, klen);
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+
+    /* Delete texts: m:t:<ino>: */
+    plen = snprintf(prefix, sizeof(prefix), "m:t:%lu:", (unsigned long)ino);
+    iter = kv_iter_prefix(db, prefix, plen);
+    while (kv_iter_valid(iter)) {
+        size_t klen;
+        const char *k = kv_iter_key(iter, &klen);
+        kv_delete(db, k, klen);
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+
+    /* Delete headers: m:h:<ino>: */
+    plen = snprintf(prefix, sizeof(prefix), "m:h:%lu:", (unsigned long)ino);
+    iter = kv_iter_prefix(db, prefix, plen);
+    while (kv_iter_valid(iter)) {
+        size_t klen;
+        const char *k = kv_iter_key(iter, &klen);
+        kv_delete(db, k, klen);
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+
+    /* Reset sequence counter */
+    char key[64];
+    int keylen = snprintf(key, sizeof(key), "m:seq:%lu", (unsigned long)ino);
+    kv_delete(db, key, keylen);
+}
+
+/* ── File content indexing ────────────────────────────── */
+
+#define MEM_CHUNK_SIZE    1600   /* target chunk size in bytes */
+#define MEM_CHUNK_OVERLAP  200   /* overlap between chunks */
+#define MEM_TEXT_PROBE     512   /* bytes to probe for binary detection */
+
+/* Check if data looks like text (no null bytes in first probe_len bytes) */
+static int mem_is_text(const char *data, size_t len)
+{
+    size_t probe = len < MEM_TEXT_PROBE ? len : MEM_TEXT_PROBE;
+    for (size_t i = 0; i < probe; i++) {
+        if (data[i] == '\0') return 0;
+    }
+    return 1;
+}
+
+int mem_index_file(struct mem_ctx *mem, void *db, uint64_t ino)
+{
+    if (!mem || !mem->running || !db) return -1;
+
+    /* Check for agentfs.noindex xattr — if set, skip indexing */
+    {
+        char xkey[KVBFS_KEY_MAX];
+        int xkeylen = kvbfs_key_xattr(xkey, sizeof(xkey), ino, "agentfs.noindex");
+        if (xkeylen > 0) {
+            char *xval = NULL;
+            size_t xvlen = 0;
+            if (kv_get(db, xkey, xkeylen, &xval, &xvlen) == 0) {
+                free(xval);
+                return 0;  /* noindex flag set, skip */
+            }
+        }
+    }
+
+    /* Read inode to get file size and block count */
+    struct kvbfs_inode_cache *ic = inode_get(ino);
+    if (!ic) return -1;
+
+    pthread_rwlock_rdlock(&ic->lock);
+    uint64_t file_size = ic->inode.size;
+    uint64_t file_blocks = ic->inode.blocks;
+    pthread_rwlock_unlock(&ic->lock);
+    inode_put(ic);
+
+    if (file_size == 0) return 0;
+
+    /* Assemble full file content from blocks */
+    char *content = malloc(file_size + 1);
+    if (!content) return -1;
+
+    size_t offset = 0;
+    for (uint64_t b = 0; b < file_blocks && offset < file_size; b++) {
+        char bkey[64];
+        int bkeylen = kvbfs_key_block(bkey, sizeof(bkey), ino, b);
+
+        char *block_data = NULL;
+        size_t block_len = 0;
+        if (kv_get(db, bkey, bkeylen, &block_data, &block_len) != 0)
+            break;
+
+        size_t copy_len = block_len;
+        if (offset + copy_len > file_size)
+            copy_len = file_size - offset;
+
+        memcpy(content + offset, block_data, copy_len);
+        free(block_data);
+        offset += copy_len;
+    }
+    content[offset] = '\0';
+
+    /* Binary file check */
+    if (!mem_is_text(content, offset)) {
+        free(content);
+        return 0;  /* skip binary files */
+    }
+
+    /* Delete old embeddings for this inode */
+    mem_delete_embeddings(db, ino);
+
+    /* Chunk and submit */
+    size_t pos = 0;
+    int n_chunks = 0;
+
+    while (pos < offset) {
+        size_t chunk_end = pos + MEM_CHUNK_SIZE;
+        if (chunk_end > offset)
+            chunk_end = offset;
+
+        /* Try to break at a newline boundary */
+        if (chunk_end < offset) {
+            size_t scan = chunk_end;
+            /* Look backward up to 200 bytes for a newline */
+            while (scan > pos + MEM_CHUNK_SIZE / 2 && content[scan] != '\n')
+                scan--;
+            if (content[scan] == '\n')
+                chunk_end = scan + 1;  /* include the newline */
+        }
+
+        /* Create null-terminated chunk */
+        size_t chunk_len = chunk_end - pos;
+        char *chunk = malloc(chunk_len + 1);
+        if (!chunk) break;
+        memcpy(chunk, content + pos, chunk_len);
+        chunk[chunk_len] = '\0';
+
+        mem_memorize(mem, db, ino, chunk, "content");
+        free(chunk);
+        n_chunks++;
+
+        /* Advance with overlap */
+        if (chunk_end >= offset)
+            break;
+        pos = chunk_end > MEM_CHUNK_OVERLAP ? chunk_end - MEM_CHUNK_OVERLAP : 0;
+    }
+
+    free(content);
+
+    printf("MEM: indexed ino=%lu size=%lu chunks=%d\n",
+           (unsigned long)ino, (unsigned long)offset, n_chunks);
     return 0;
 }
 

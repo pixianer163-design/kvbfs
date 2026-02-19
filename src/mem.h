@@ -56,6 +56,8 @@ void  mem_destroy(struct mem_ctx *mem);
 float *mem_embed_text(struct mem_ctx *mem, const char *text, int text_len);
 int   mem_memorize(struct mem_ctx *mem, void *db, uint64_t ino,
                    const char *text, const char *role);
+int   mem_index_file(struct mem_ctx *mem, void *db, uint64_t ino);
+void  mem_delete_embeddings(void *db, uint64_t ino);
 uint32_t mem_next_gen(void *db, uint64_t ino);
 struct cfs_mem_query;
 int   mem_search(struct mem_ctx *mem, void *db, struct cfs_mem_query *query);

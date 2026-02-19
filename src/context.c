@@ -15,8 +15,9 @@ static uint64_t ensure_sessions_dir(struct kvbfs_ctx *ctx)
     const char *name = "sessions";
 
     /* 在根目录下查找 */
-    char key[256];
+    char key[KVBFS_KEY_MAX];
     int keylen = kvbfs_key_dirent(key, sizeof(key), KVBFS_ROOT_INO, name);
+    if (keylen < 0) return 0;
 
     char *val = NULL;
     size_t vlen = 0;
@@ -110,6 +111,35 @@ int ctx_init_llm(struct kvbfs_ctx *ctx, const struct llm_config *config)
         return -1;
     }
 
+    /* Initialize session_set hash for O(1) is_session_file lookup */
+    ctx->session_set = NULL;
+    pthread_mutex_init(&ctx->session_lock, NULL);
+
+    /* Populate session_set from /sessions directory entries */
+    char prefix[64];
+    int prefix_len = kvbfs_key_dirent_prefix(prefix, sizeof(prefix),
+                                              ctx->sessions_ino);
+    kv_iterator_t *iter = kv_iter_prefix(ctx->db, prefix, prefix_len);
+    while (kv_iter_valid(iter)) {
+        size_t vlen;
+        const char *val = kv_iter_value(iter, &vlen);
+        if (vlen == sizeof(uint64_t)) {
+            uint64_t child_ino;
+            memcpy(&child_ino, val, sizeof(uint64_t));
+
+            struct session_ino_entry *entry = malloc(sizeof(*entry));
+            if (entry) {
+                entry->ino = child_ino;
+                HASH_ADD(hh, ctx->session_set, ino, sizeof(uint64_t), entry);
+            }
+        }
+        kv_iter_next(iter);
+    }
+    kv_iter_free(iter);
+
+    printf("CFS: loaded %u session inodes into hash set\n",
+           HASH_COUNT(ctx->session_set));
+
     /* 初始化 LLM 子系统 */
     return llm_init(&ctx->llm, config);
 }
@@ -132,6 +162,16 @@ void ctx_destroy(struct kvbfs_ctx *ctx)
 
 #ifdef CFS_LOCAL_LLM
     llm_destroy(&ctx->llm);
+
+    /* Free session_set hash */
+    {
+        struct session_ino_entry *entry, *tmp;
+        HASH_ITER(hh, ctx->session_set, entry, tmp) {
+            HASH_DEL(ctx->session_set, entry);
+            free(entry);
+        }
+        pthread_mutex_destroy(&ctx->session_lock);
+    }
 #endif
 
     /* 同步所有脏 inode */
