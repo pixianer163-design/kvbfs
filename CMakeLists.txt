@@ -129,6 +129,7 @@ set(KVBFS_SOURCES
     src/context.c
     src/version.c
     src/utils.c
+    src/vfs_versions.c
     ${LLM_SOURCES}
     ${MEM_SOURCES}
 )
