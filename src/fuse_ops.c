@@ -677,6 +677,11 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 static void kvbfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    if (ino == AGENTFS_VERSIONS_INO || vtree_is_vnode(ino)) {
+        fuse_reply_open(req, fi);
+        return;
+    }
+
     struct kvbfs_inode_cache *ic = inode_get(ino);
     if (!ic) {
         fuse_reply_err(req, ENOENT);
@@ -701,6 +706,154 @@ static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
                           off_t off, struct fuse_file_info *fi)
 {
     (void)fi;
+
+    /* .versions root: list real root entries as virtual dirs */
+    if (ino == AGENTFS_VERSIONS_INO) {
+        char *buf = malloc(size);
+        if (!buf) { fuse_reply_err(req, ENOMEM); return; }
+        size_t buf_used = 0;
+        off_t entry_idx = 0;
+
+        if (off <= 0) {
+            struct stat st; versions_root_stat(&st);
+            size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                          ".", &st, ++entry_idx);
+            if (es <= size - buf_used) buf_used += es;
+        }
+        if (off <= 1) {
+            struct stat st = {.st_ino = KVBFS_ROOT_INO, .st_mode = S_IFDIR};
+            size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                          "..", &st, ++entry_idx);
+            if (es <= size - buf_used) buf_used += es;
+        }
+
+        char prefix[64];
+        int prefix_len = kvbfs_key_dirent_prefix(prefix, sizeof(prefix), KVBFS_ROOT_INO);
+        kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, prefix_len);
+        while (kv_iter_valid(iter)) {
+            entry_idx++;
+            if (entry_idx <= off) { kv_iter_next(iter); continue; }
+
+            size_t klen;
+            const char *k = kv_iter_key(iter, &klen);
+            const char *name = k + prefix_len;
+            size_t nlen = klen - prefix_len;
+            size_t vlen;
+            const char *val = kv_iter_value(iter, &vlen);
+            uint64_t child_real_ino = 0;
+            if (vlen == sizeof(uint64_t)) memcpy(&child_real_ino, val, sizeof(uint64_t));
+
+            char nbuf[256];
+            if (nlen >= sizeof(nbuf)) nlen = sizeof(nbuf) - 1;
+            memcpy(nbuf, name, nlen); nbuf[nlen] = '\0';
+
+            uint64_t vino = vtree_alloc_dir(&g_ctx->vtree, AGENTFS_VERSIONS_INO,
+                                            nbuf, child_real_ino);
+            struct stat st = {.st_ino = vino, .st_mode = S_IFDIR | 0555};
+            size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                          nbuf, &st, entry_idx + 1);
+            if (es > size - buf_used) { kv_iter_free(iter); goto vr_done; }
+            buf_used += es;
+            kv_iter_next(iter);
+        }
+        kv_iter_free(iter);
+    vr_done:
+        fuse_reply_buf(req, buf, buf_used);
+        free(buf);
+        return;
+    }
+
+    /* Virtual tree node readdir */
+    if (vtree_is_vnode(ino)) {
+        struct vtree_node *vn = vtree_get(&g_ctx->vtree, ino);
+        if (!vn || vn->is_version_file) { fuse_reply_err(req, ENOTDIR); return; }
+
+        char *buf = malloc(size);
+        if (!buf) { fuse_reply_err(req, ENOMEM); return; }
+        size_t buf_used = 0;
+        off_t entry_idx = 0;
+
+        if (off <= 0) {
+            struct stat st; vnode_stat(vn, &st);
+            size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                          ".", &st, ++entry_idx);
+            if (es <= size - buf_used) buf_used += es;
+        }
+        if (off <= 1) {
+            struct stat st = {.st_ino = ino, .st_mode = S_IFDIR};
+            size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                          "..", &st, ++entry_idx);
+            if (es <= size - buf_used) buf_used += es;
+        }
+
+        struct kvbfs_inode ri;
+        int is_dir = 0;
+        if (inode_load(vn->real_ino, &ri) == 0) is_dir = S_ISDIR(ri.mode);
+
+        if (is_dir) {
+            char prefix[64];
+            int plen = kvbfs_key_dirent_prefix(prefix, sizeof(prefix), vn->real_ino);
+            kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, plen);
+            while (kv_iter_valid(iter)) {
+                entry_idx++;
+                if (entry_idx <= off) { kv_iter_next(iter); continue; }
+                size_t klen;
+                const char *k = kv_iter_key(iter, &klen);
+                const char *name = k + plen;
+                size_t nlen = klen - plen;
+                size_t vlen;
+                const char *val = kv_iter_value(iter, &vlen);
+                uint64_t child_real = 0;
+                if (vlen == sizeof(uint64_t)) memcpy(&child_real, val, sizeof(uint64_t));
+
+                char nbuf[256];
+                if (nlen >= sizeof(nbuf)) nlen = sizeof(nbuf) - 1;
+                memcpy(nbuf, name, nlen); nbuf[nlen] = '\0';
+
+                uint64_t cvino = vtree_alloc_dir(&g_ctx->vtree, ino, nbuf, child_real);
+                struct stat st = {.st_ino = cvino, .st_mode = S_IFDIR | 0555};
+                size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                              nbuf, &st, entry_idx + 1);
+                if (es > size - buf_used) { kv_iter_free(iter); goto vn_done; }
+                buf_used += es;
+                kv_iter_next(iter);
+            }
+            kv_iter_free(iter);
+        } else {
+            /* real_ino is a file: enumerate version numbers */
+            char prefix[64];
+            int plen = kvbfs_key_version_meta_prefix(prefix, sizeof(prefix), vn->real_ino);
+            kv_iterator_t *iter = kv_iter_prefix(g_ctx->db, prefix, plen);
+            while (kv_iter_valid(iter)) {
+                entry_idx++;
+                if (entry_idx <= off) { kv_iter_next(iter); continue; }
+
+                size_t klen;
+                const char *k = kv_iter_key(iter, &klen);
+                const char *ver_str = k + plen;
+                size_t ver_len = klen - plen;
+
+                char nbuf[32];
+                if (ver_len >= sizeof(nbuf)) ver_len = sizeof(nbuf) - 1;
+                memcpy(nbuf, ver_str, ver_len); nbuf[ver_len] = '\0';
+                uint64_t ver = strtoull(nbuf, NULL, 10);
+
+                uint64_t cvino = vtree_alloc_vfile(&g_ctx->vtree, ino, nbuf,
+                                                   vn->real_ino, ver);
+                struct stat st = {.st_ino = cvino, .st_mode = S_IFREG | 0444};
+                size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                              nbuf, &st, entry_idx + 1);
+                if (es > size - buf_used) { kv_iter_free(iter); goto vn_done; }
+                buf_used += es;
+                kv_iter_next(iter);
+            }
+            kv_iter_free(iter);
+        }
+    vn_done:
+        fuse_reply_buf(req, buf, buf_used);
+        free(buf);
+        return;
+    }
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
     if (!ic) {
@@ -805,6 +958,15 @@ static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
             agentfs_events_stat(&evt_st);
             size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
                                                AGENTFS_EVENTS_NAME, &evt_st, entry_idx + 1);
+            if (entsize <= size - buf_used)
+                buf_used += entsize;
+        }
+        entry_idx++;
+        if (entry_idx > off) {
+            struct stat ver_st;
+            versions_root_stat(&ver_st);
+            size_t entsize = fuse_add_direntry(req, buf + buf_used, size - buf_used,
+                                               AGENTFS_VERSIONS_NAME, &ver_st, entry_idx + 1);
             if (entsize <= size - buf_used)
                 buf_used += entsize;
         }
