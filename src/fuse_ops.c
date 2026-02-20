@@ -524,6 +524,20 @@ static void kvbfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
         fuse_reply_attr(req, &st, 0);
         return;
     }
+    if (ino == AGENTFS_VERSIONS_INO) {
+        struct stat st;
+        versions_root_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
+    if (vtree_is_vnode(ino)) {
+        struct vtree_node *vn = vtree_get(&g_ctx->vtree, ino);
+        if (!vn) { fuse_reply_err(req, ENOENT); return; }
+        struct stat st;
+        vnode_stat(vn, &st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
 #endif
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
@@ -558,6 +572,20 @@ static void kvbfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     if (ino == AGENTFS_EVENTS_INO) {
         struct stat st;
         agentfs_events_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
+    if (ino == AGENTFS_VERSIONS_INO) {
+        struct stat st;
+        versions_root_stat(&st);
+        fuse_reply_attr(req, &st, 0);
+        return;
+    }
+    if (vtree_is_vnode(ino)) {
+        struct vtree_node *vn = vtree_get(&g_ctx->vtree, ino);
+        if (!vn) { fuse_reply_err(req, ENOENT); return; }
+        struct stat st;
+        vnode_stat(vn, &st);
         fuse_reply_attr(req, &st, 0);
         return;
     }
