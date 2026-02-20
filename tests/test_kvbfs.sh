@@ -821,6 +821,67 @@ else
 fi
 
 # ============================================================
+echo "--- Test 52: .versions appears in root listing ---"
+LS_ROOT=$(ls -la "$MNT/" 2>/dev/null)
+if echo "$LS_ROOT" | grep -q '\.versions'; then
+    pass ".versions appears in root listing"
+else
+    fail ".versions in root listing" "not found in: $(ls "$MNT/")"
+fi
+
+# ============================================================
+echo "--- Test 53: .versions/<file>/ lists version numbers ---"
+echo "version one content" > "$MNT/ver_test.txt"
+echo "version two content" > "$MNT/ver_test.txt"
+sleep 0.3
+VER_LIST=$(ls "$MNT/.versions/ver_test.txt/" 2>/dev/null)
+if echo "$VER_LIST" | grep -qE '^[0-9]+$|[[:space:]][0-9]+|^[0-9]'; then
+    pass ".versions/<file>/ lists version numbers"
+else
+    fail ".versions version listing" "got: $VER_LIST"
+fi
+
+# ============================================================
+echo "--- Test 54: .versions/<file>/1 contains v1 content ---"
+V1_CONTENT=$(cat "$MNT/.versions/ver_test.txt/1" 2>/dev/null)
+if echo "$V1_CONTENT" | grep -q "version one content"; then
+    pass ".versions version 1 content correct"
+else
+    fail ".versions version 1 content" "got: $V1_CONTENT"
+fi
+
+# ============================================================
+echo "--- Test 55: .versions/<file>/2 contains v2 content ---"
+V2_CONTENT=$(cat "$MNT/.versions/ver_test.txt/2" 2>/dev/null)
+if echo "$V2_CONTENT" | grep -q "version two content"; then
+    pass ".versions version 2 content correct"
+else
+    fail ".versions version 2 content" "got: $V2_CONTENT"
+fi
+
+# ============================================================
+echo "--- Test 56: cp from .versions restores old version ---"
+cp "$MNT/.versions/ver_test.txt/1" "$MNT/ver_test.txt"
+sleep 0.1
+RESTORED=$(cat "$MNT/ver_test.txt" 2>/dev/null)
+if echo "$RESTORED" | grep -q "version one content"; then
+    pass ".versions restore via cp"
+else
+    fail ".versions restore" "got: $RESTORED"
+fi
+rm -f "$MNT/ver_test.txt" 2>/dev/null
+
+# ============================================================
+echo "--- Test 57: .versions files are read-only ---"
+echo "should fail" > "$MNT/.versions/" 2>/dev/null
+RET=$?
+if [ "$RET" -ne 0 ]; then
+    pass ".versions write rejected"
+else
+    fail ".versions write protection" "write succeeded unexpectedly"
+fi
+
+# ============================================================
 echo ""
 echo "========================================="
 echo -e "  ${GREEN}PASS: $PASS${NC}  ${RED}FAIL: $FAIL${NC}  ${YELLOW}SKIP: $SKIP${NC}"
