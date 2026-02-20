@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "uthash.h"
+#include "vfs_versions.h"
 
 #ifdef CFS_LOCAL_LLM
 #include "llm.h"
@@ -70,6 +71,7 @@ struct kvbfs_ctx {
     pthread_mutex_t icache_lock;        /* 缓存表锁 */
     pthread_mutex_t alloc_lock;         /* inode 分配锁 */
     struct kvbfs_super super;           /* 超级块 */
+    struct vtree_ctx vtree;             /* Version virtual directory tree */
 
 #ifdef CFS_LOCAL_LLM
     struct llm_ctx llm;                 /* LLM 推理子系统 */

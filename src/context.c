@@ -90,6 +90,8 @@ struct kvbfs_ctx *ctx_init(const char *db_path)
     /* inode 缓存初始化为空 */
     ctx->icache = NULL;
 
+    vtree_init(&ctx->vtree);
+
     /* 加载超级块 */
     if (super_load(ctx) != 0) {
         fprintf(stderr, "Failed to load superblock\n");
@@ -178,6 +180,8 @@ void ctx_destroy(struct kvbfs_ctx *ctx)
         pthread_mutex_destroy(&ctx->session_lock);
     }
 #endif
+
+    vtree_destroy(&ctx->vtree);
 
     /* 同步所有脏 inode */
     inode_sync_all();
