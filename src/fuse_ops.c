@@ -59,6 +59,45 @@ static void agentfs_events_stat(struct stat *st)
     st->st_ctim = st->st_atim;
 }
 
+static void versions_root_stat(struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_ino   = AGENTFS_VERSIONS_INO;
+    st->st_mode  = S_IFDIR | 0555;
+    st->st_nlink = 2;
+    st->st_uid   = getuid();
+    st->st_gid   = getgid();
+    clock_gettime(CLOCK_REALTIME, &st->st_atim);
+    st->st_mtim  = st->st_atim;
+    st->st_ctim  = st->st_atim;
+}
+
+static void vnode_stat(struct vtree_node *vn, struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_ino = vn->vino;
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+
+    if (!vn->is_version_file) {
+        st->st_mode  = S_IFDIR | 0555;
+        st->st_nlink = 2;
+        clock_gettime(CLOCK_REALTIME, &st->st_atim);
+        st->st_mtim  = st->st_atim;
+    } else {
+        struct kvbfs_version_meta meta;
+        st->st_mode  = S_IFREG | 0444;
+        st->st_nlink = 1;
+        if (version_get_meta(vn->real_ino, vn->version, &meta) == 0) {
+            st->st_size   = (off_t)meta.size;
+            st->st_blocks = (blkcnt_t)((meta.size + 511) / 512);
+            st->st_mtim   = meta.mtime;
+        }
+        clock_gettime(CLOCK_REALTIME, &st->st_atim);
+    }
+    st->st_ctim = st->st_atim;
+}
+
 /* Resolve inode number to a path by walking dirent entries backwards */
 static int ino_to_path(uint64_t ino, char *buf, size_t buflen)
 {
@@ -377,6 +416,69 @@ static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         return;
     }
 #endif
+
+    /* Virtual .versions root */
+    if (parent == KVBFS_ROOT_INO && strcmp(name, AGENTFS_VERSIONS_NAME) == 0) {
+        struct fuse_entry_param e;
+        memset(&e, 0, sizeof(e));
+        e.ino           = AGENTFS_VERSIONS_INO;
+        e.attr_timeout  = 0;
+        e.entry_timeout = 0;
+        versions_root_stat(&e.attr);
+        fuse_reply_entry(req, &e);
+        return;
+    }
+
+    /* Child lookup within .versions virtual tree */
+    if (parent == AGENTFS_VERSIONS_INO || vtree_is_vnode(parent)) {
+        uint64_t parent_real_ino;
+        if (parent == AGENTFS_VERSIONS_INO) {
+            parent_real_ino = KVBFS_ROOT_INO;
+        } else {
+            struct vtree_node *pn = vtree_get(&g_ctx->vtree, parent);
+            if (!pn) { fuse_reply_err(req, ENOENT); return; }
+            parent_real_ino = pn->real_ino;
+        }
+
+        struct kvbfs_inode parent_inode;
+        int parent_is_dir = 0;
+        if (inode_load(parent_real_ino, &parent_inode) == 0)
+            parent_is_dir = S_ISDIR(parent_inode.mode);
+
+        uint64_t vino;
+        struct stat st;
+
+        if (parent_is_dir) {
+            uint64_t child_real_ino = dirent_lookup(parent_real_ino, name);
+            if (child_real_ino == 0) { fuse_reply_err(req, ENOENT); return; }
+            vino = vtree_alloc_dir(&g_ctx->vtree, parent, name, child_real_ino);
+            if (!vino) { fuse_reply_err(req, ENOMEM); return; }
+            struct vtree_node *cn = vtree_get(&g_ctx->vtree, vino);
+            vnode_stat(cn, &st);
+        } else {
+            char *endptr;
+            uint64_t ver = strtoull(name, &endptr, 10);
+            if (*endptr != '\0' || ver == 0) { fuse_reply_err(req, ENOENT); return; }
+            struct kvbfs_version_meta vmeta;
+            if (version_get_meta(parent_real_ino, ver, &vmeta) != 0) {
+                fuse_reply_err(req, ENOENT); return;
+            }
+            vino = vtree_alloc_vfile(&g_ctx->vtree, parent, name,
+                                     parent_real_ino, ver);
+            if (!vino) { fuse_reply_err(req, ENOMEM); return; }
+            struct vtree_node *cn = vtree_get(&g_ctx->vtree, vino);
+            vnode_stat(cn, &st);
+        }
+
+        struct fuse_entry_param e;
+        memset(&e, 0, sizeof(e));
+        e.ino           = vino;
+        e.attr_timeout  = 0;
+        e.entry_timeout = 0;
+        e.attr          = st;
+        fuse_reply_entry(req, &e);
+        return;
+    }
 
     uint64_t child_ino = dirent_lookup(parent, name);
     if (child_ino == 0) {
