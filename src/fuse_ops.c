@@ -457,8 +457,10 @@ static void kvbfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
             vnode_stat(cn, &st);
         } else {
             char *endptr;
-            uint64_t ver = strtoull(name, &endptr, 10);
-            if (*endptr != '\0' || ver == 0) { fuse_reply_err(req, ENOENT); return; }
+            uint64_t uver = strtoull(name, &endptr, 10);
+            if (*endptr != '\0' || uver == 0) { fuse_reply_err(req, ENOENT); return; }
+            /* Convert 1-indexed user-visible name to 0-indexed internal version */
+            uint64_t ver = uver - 1;
             struct kvbfs_version_meta vmeta;
             if (version_get_meta(parent_real_ino, ver, &vmeta) != 0) {
                 fuse_reply_err(req, ENOENT); return;
@@ -838,11 +840,16 @@ static void kvbfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
                 memcpy(nbuf, ver_str, ver_len); nbuf[ver_len] = '\0';
                 uint64_t ver = strtoull(nbuf, NULL, 10);
 
-                uint64_t cvino = vtree_alloc_vfile(&g_ctx->vtree, ino, nbuf,
+                /* Expose 1-indexed names to the user (internal storage is 0-indexed) */
+                char display_name[32];
+                snprintf(display_name, sizeof(display_name), "%llu",
+                         (unsigned long long)(ver + 1));
+
+                uint64_t cvino = vtree_alloc_vfile(&g_ctx->vtree, ino, display_name,
                                                    vn->real_ino, ver);
                 struct stat st = {.st_ino = cvino, .st_mode = S_IFREG | 0444};
                 size_t es = fuse_add_direntry(req, buf + buf_used, size - buf_used,
-                                              nbuf, &st, entry_idx + 1);
+                                              display_name, &st, entry_idx + 1);
                 if (es > size - buf_used) { kv_iter_free(iter); goto vn_done; }
                 buf_used += es;
                 kv_iter_next(iter);
@@ -1308,6 +1315,27 @@ static void kvbfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
         fuse_reply_open(req, fi);
         return;
     }
+    if (ino == AGENTFS_VERSIONS_INO) {
+        fuse_reply_err(req, EISDIR);
+        return;
+    }
+    if (vtree_is_vnode(ino)) {
+        struct vtree_node *vn = vtree_get(&g_ctx->vtree, ino);
+        if (!vn) { fuse_reply_err(req, ENOENT); return; }
+        if (!vn->is_version_file) { fuse_reply_err(req, EISDIR); return; }
+        if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+            fuse_reply_err(req, EACCES);
+            return;
+        }
+        struct version_fh *vfh = calloc(1, sizeof(*vfh));
+        if (!vfh) { fuse_reply_err(req, ENOMEM); return; }
+        vfh->real_ino = vn->real_ino;
+        vfh->version  = vn->version;
+        fi->fh        = (uint64_t)(uintptr_t)vfh;
+        fi->direct_io = 1;
+        fuse_reply_open(req, fi);
+        return;
+    }
 #endif
 
     struct kvbfs_inode_cache *ic = inode_get(ino);
@@ -1372,6 +1400,12 @@ static void kvbfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
     if (ino == AGENTFS_EVENTS_INO) {
         struct events_fh *efh = (struct events_fh *)(uintptr_t)fi->fh;
         free(efh);
+        fuse_reply_err(req, 0);
+        return;
+    }
+    if (vtree_is_vnode(ino)) {
+        struct version_fh *vfh = (struct version_fh *)(uintptr_t)fi->fh;
+        free(vfh);
         fuse_reply_err(req, 0);
         return;
     }
@@ -1466,6 +1500,35 @@ static void kvbfs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 
         fuse_reply_buf(req, tmp, size);
         free(tmp);
+        return;
+    }
+    if (vtree_is_vnode(ino)) {
+        struct version_fh *vfh = (struct version_fh *)(uintptr_t)fi->fh;
+        if (!vfh) { fuse_reply_err(req, EIO); return; }
+
+        uint64_t start_block = (uint64_t)off / KVBFS_BLOCK_SIZE;
+        uint64_t end_block   = ((uint64_t)off + size - 1) / KVBFS_BLOCK_SIZE;
+
+        char *outbuf = calloc(1, size);
+        if (!outbuf) { fuse_reply_err(req, ENOMEM); return; }
+        size_t copied = 0;
+
+        for (uint64_t blk = start_block; blk <= end_block && copied < size; blk++) {
+            char *data = NULL;
+            size_t dlen = 0;
+            if (version_read_block(vfh->real_ino, vfh->version, blk,
+                                   &data, &dlen) != 0)
+                break;
+            size_t blk_off = (blk == start_block) ? ((uint64_t)off % KVBFS_BLOCK_SIZE) : 0;
+            size_t avail   = dlen > blk_off ? dlen - blk_off : 0;
+            size_t tocopy  = avail < (size - copied) ? avail : (size - copied);
+            memcpy(outbuf + copied, data + blk_off, tocopy);
+            copied += tocopy;
+            free(data);
+        }
+
+        fuse_reply_buf(req, outbuf, copied);
+        free(outbuf);
         return;
     }
 #endif
